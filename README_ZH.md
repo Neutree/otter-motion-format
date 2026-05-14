@@ -1,9 +1,12 @@
 OMF: otter-motion-format
 ========
 
+中文 | [English](./README.md)
+
 ## 简介
 
 用来规范化机器人动作数据格式，方便用于数据采集、训练、日志记录等场合。
+方便统一规范化数据，并且支持常见格式互转。
 
 
 ## 数据格式
@@ -97,6 +100,7 @@ target/model_target/actual:
 本库是一个 Python 库，有几种可选安装方法：
 * `pip install otter-motion-format`：核心读写依赖，不包括显示界面依赖的库
 * `pip install "otter-motion-format[viz]"`：加上曲线可视化依赖
+* `pip install "otter-motion-format[all]"`：安装所有依赖，目前和viz 一样
 
 
 支持读取、可视化、保存数据：
@@ -105,7 +109,7 @@ target/model_target/actual:
 import otter_motion_format as omf
 
 motion = omf.load("walk.msgpack")
-motion.summary()
+motion.summary()                        # 终端输出数据概况
 motion.show_chart(["target.joint.pos"]) # 默认会显示所有曲线，可以在界面只勾选想要看的曲线，也可以参数传入想看的曲线， rot 会被转换成 rotvec 和欧拉角
 
 motion.save("walk.yaml")
@@ -132,29 +136,22 @@ for i in range(100):
 motion.save("test_motion.msgpack")
 ```
 
-## 当前已实现功能
+## 可视化功能说明
 
-已经完成的能力：
-
-* `OMF(...)` 创建标准数据容器
-* `load(...)` 读取 `.msgpack/.yaml/.json`
-* `save(...)` 按后缀保存 `.msgpack/.yaml/.json`
-* `summary()` 输出概要信息
-* `show_chart(...)` 打开交互式曲线查看器
+正如前面说的`motion.show_chart()`可以用界面显示曲线，另外也可以用命令行打开
+```shell
+otter-motion-format "数据文件路径.msgpack"
+```
+注意需要先 `pip install "otter-motion-format[viz]"` 或者 `pip install "otter-motion-format[all]"`安装界面的依赖包。
 
 曲线查看器目前支持：
 
 * 多种类型数据同时保存，比如 `target` 和 `actual`， 分 tab 查看
 * 搜索曲线名
 * `All / None / Invert` 快速勾选
-* 鼠标拖动平移、滚轮缩放
-* 适合大量曲线数据的 pyqtgraph 下采样显示
-
-实现上选择 `pyqtgraph`，原因是：
-
-* 比 `matplotlib` 更适合高频交互和大量点数据
-* 依赖比 `echarts` 方案更轻，不需要额外前端打包和 Web 容器
-* 后续和 `robot-data-editor` 统一技术栈更顺滑
+* 鼠标左键拖动平移、右键快速缩放、滚轮缩放
+* 支持查看鼠标指针位置当前时刻值
+* 支持修改曲线颜色
 
 
 

@@ -1,177 +1,159 @@
 OMF: otter-motion-format
-=========
+========
 
-## Overview
+[中文](./README_CN.md) | English
 
-OMF standardizes robot motion data for collection, training, playback, logging, and analysis.
+## Introduction
 
-Robot motion datasets usually contain at least two categories of data:
+A standardized format for robot motion data, designed for data collection, training, logging, and related applications.
+It helps unify data representation and supports conversion between common file formats.
 
-1. Target data, such as commanded joint angles and controller timing.
-2. Actual data, such as measured joint states, sensor readings, and execution timing.
 
-An OMF file can store multiple named data layers at once, for example `target`, `model_target`, and `actual`.
+## Data Format
 
-## Format
 
-Top-level structure:
+Robot data generally contains two major categories:
+1. Target: Target data used for data collection and training, such as desired joint angles and frame rates.
+2. Actual: Actual sensor data, such as measured motor angles, temperatures, and frame rates.
+
+The data may include, but is not limited to:
+
+* Robot information, such as model / number of joints / joint names
+* Pose in the world coordinate system (translation and rotation)
+* Joint angle / velocity / acceleration / torque / temperature for each joint
+* Pose / linear velocity / angular velocity for each link
+* Sensor data, such as IMU orientation and even images
+* Data frame rate / execution time
+
+
+Based on these requirements, we define the following format:
+
+Top level:
+
+```yaml
+version: 1    # Protocol version
+format: omf   # Format identifier, used to verify that this is an OMF file
+basic:        # Basic and shared information, such as data name and robot information
+target:       # Desired motion data
+actual:       # Actual recorded motion data, used for logs
+````
+
+`basic`:
 
 ```yaml
 version: 1
 format: omf
 basic:
-target:
-actual:
+    name: walk stright
+    robot: agibot_x2 # Recommended format: manufacturer + model
+    date: 2026-05-13 00:00:00
+    joint_names: ["left_hip_pitch", ..., "waist_yaw"] # Joint names; all subsequent data strictly follows this order
+    joint_dims: [1, ...., 1]
+    link_names: ["left_ankle_link"]
+    imu_names: ["base", "torso"]
+    time_names: ["dt", "model_run"]
+    data_names: ["target", "model_target", "actual"]
 ```
 
-The `basic` section contains shared metadata:
-
-```yaml
-basic:
-  name: walk straight
-  robot: agibot_x2
-  date: 2026-05-13 00:00:00
-  joint_names: ["left_hip_pitch", "right_hip_pitch"]
-  joint_dims: [1, 1]
-  link_names: ["left_ankle_link"]
-  imu_names: ["base", "torso"]
-  time_names: ["dt", "model_run"]
-  data_names: ["target", "model_target", "actual"]
-```
-
-Each named data section listed in `basic.data_names` shares the same layout:
+`target/model_target/actual` data can contain multiple data groups according to `data_names`:
 
 ```yaml
 target/model_target/actual:
-  fps: 50
-  length: 600
-  root_pos: [[0.0, 0.0, 0.0], ...]
-  root_rot: [[w, x, y, z], ...]
-  joint:
-    pos: []
-    vel: []
-    acc: []
-    tau: []
-  link:
-    pos: []
-    rot: []
-    lin_vel: []
-    ang_vel: []
-  imu:
-    pos: []
-    rot: []
-    gyro: []
-    acc: []
-    lin_vel: []
-  time: []
+    fps: 50
+    length: 600 # Total number of frames
+    root_pos: [[0.0, 0.0, 0.0], ...] # Root position in the world coordinate system, in meters
+    root_rot: [[w, x, y, z], ...]    # Root rotation in the world coordinate system, quaternion
+    joint:
+        pos:
+            - [1.0, ...] # Joint angles; the number of values for each joint corresponds to dof_dim
+            - [1.1, ...] # Contains `length` arrays
+        vel: [] # Same format as joint.pos, joint velocities
+        acc: [] # Same format as joint.pos, joint accelerations
+        tau: [] # Same format as joint.pos, joint torques
+    link:
+        pos: []     # shape: (length, link_num, 3(xyz)) Position in the world coordinate system
+        rot: []     # shape: (length, link_num, 4(wxyz)) Rotation in the world coordinate system
+        lin_vel: [] # shape: (length, link_num, 3(xyz)) Linear velocity in the world coordinate system
+        ang_vel: [] # shape: (length, link_num, 3(wx,wy,wz)) Angular velocity in the world coordinate system
+    imu:
+        pos: []     # shape: (length, link_num, 3(xyz)) Position in the world coordinate system
+        rot: []     # shape: (length, link_num, 4(wxyz)) Rotation in the world coordinate system
+        gyro: []    # shape: (length, link_num, 3(xyz)) Gyroscope angular velocity
+        acc: []     # shape: (length, link_num, 3(xyz)) Acceleration
+        lin_vel: [] # shape: (length, link_num, 3(xyz)) Linear velocity, optional
+    time: [] # shape: (len(time_names), length); typically used to record execution timings
 ```
 
-Quaternion storage order in OMF is `wxyz`.
+## Storage Formats
 
-## Storage Backends
+There are several common ways to store data:
 
-Supported file formats:
+* JSON/YAML text files: easy to read, but relatively large in size
+* Pickle: directly stores Python variables, convenient but may be incompatible across library versions and is not suitable for long-term storage
+* MessagePack: a binary version of JSON, producing smaller files; not directly human-readable but can be inspected using tools
 
-- `.msgpack` for compact binary storage and fast I/O
-- `.yaml` for readable text exports
-- `.json` for interoperable text exports
+The primary storage format chosen is `MessagePack`, which offers small file size, fast read/write performance, and broad software support across many programming languages.
+YAML and JSON are also supported, with file extensions `.msgpack`, `.yaml`, and `.json`.
 
-## Installation
+## Supported Operations
 
-Core library:
+This library is a Python package and can be installed in several ways:
 
-```bash
-pip install otter-motion-format
-```
+* `pip install otter-motion-format`: core read/write functionality only, without visualization dependencies
+* `pip install "otter-motion-format[viz]"`: includes curve visualization dependencies
+* `pip install "otter-motion-format[all]"`: installs all dependencies; currently the same as `viz`
 
-With interactive visualization:
-
-```bash
-pip install "otter-motion-format[viz]"
-```
-
-## Python Usage
-
-Load and inspect an existing motion:
+Supports loading, visualization, and saving:
 
 ```python
 import otter_motion_format as omf
 
 motion = omf.load("walk.msgpack")
-motion.summary()
-motion.show_chart(["target.joint.pos"])
+motion.summary()                        # Print a summary of the data in the terminal
+motion.show_chart(["target.joint.pos"]) # By default, all curves are shown. You can select curves in the GUI or pass specific curve names.
+                                        # Rotations are automatically converted to rotation vectors and Euler angles.
+
 motion.save("walk.yaml")
 ```
 
-Create a new motion container:
+Adding data:
 
 ```python
-import numpy as np
 import otter_motion_format as omf
+import numpy as np
 
-joint_names = ["left_hip_pitch", "right_hip_pitch"]
+robot_joint_names = ["left_hip_pitch", "right_hip_pitch"] # Define your robot joint names
+motion = omf.OMF(name="walk",
+                 robot="agibot_x2",
+                 joint_names=robot_joint_names,
+                 joint_dims=[1] * len(robot_joint_names),
+                 data_names=["target", "model_target", "actual"]
+                )
 
-motion = omf.OMF(
-    name="walk",
-    robot="agibot_x2",
-    joint_names=joint_names,
-    joint_dims=[1] * len(joint_names),
-    data_names=["target", "model_target", "actual"],
-)
-
-for index in range(100):
-    motion.target["joint"]["pos"].append([1.0, 1.0 + index * 0.01])
+for i in range(100):
+    # Directly manipulate the dictionary
+    motion.target["joint"]["pos"].append([1.0, 1.0 + i * 0.01])
     motion.target["joint"]["vel"].append(np.array([0.1, 0.1]))
-
 motion.save("test_motion.msgpack")
 ```
 
-`OMF(...)` now requires `name` and `robot` when creating a new container.
+## Visualization Features
 
-## Viewer
+As mentioned earlier, `motion.show_chart()` can be used to display curves in a GUI. You can also open files directly from the command line:
 
-`show_chart(...)` opens an interactive viewer built with `PySide6 + pyqtgraph`.
-
-Current viewer behavior:
-
-- Separate tabs for each named data layer
-- Searchable channel lists
-- `All / None / Invert` quick toggles
-- One highlighted current curve per tab
-- Checked curves from all tabs drawn together
-- Mouse hover crosshair with current time and all visible values
-- Drag to pan, wheel to zoom
-- Downsampling suitable for dense motion logs
-
-By default, root rotations are expanded into both rotation-vector and Euler-angle channels. You can still force only one representation with `rot_format="rotvec"` or `rot_format="euler"`.
-
-## CLI
-
-View an OMF file:
-
-```bash
-otter-motion-format walk.msgpack
-otter-motion-format walk.msgpack --rot-format both
+```shell
+otter-motion-format "path/to/data_file.msgpack"
 ```
 
-Convert GMR to OMF:
+Note that you need to install the visualization dependencies first using
+`pip install "otter-motion-format[viz]"` or `pip install "otter-motion-format[all]"`.
 
-```bash
-otter-gmr-to-omf input.pkl output.msgpack --robot agibot_x2 --data-name target
-```
+The curve viewer currently supports:
 
-Convert OMF to GMR:
-
-```bash
-otter-omf-to-gmr input.msgpack output.pkl --data-name actual
-```
-
-## Implemented Capabilities
-
-- `OMF(...)` creates a standard motion container
-- `load(...)` reads `.msgpack/.yaml/.json`
-- `save(...)` writes `.msgpack/.yaml/.json`
-- `summary()` prints a compact overview
-- `show_chart(...)` opens the interactive multi-layer curve viewer
-- `otter-gmr-to-omf` and `otter-omf-to-gmr` convert between GMR pickle files and OMF
+* Saving multiple data types simultaneously, such as `target` and `actual`, with separate tabs for each
+* Searching for curve names
+* `All / None / Invert` quick selection
+* Left mouse button to pan, right mouse button to zoom quickly, mouse wheel to zoom
+* Viewing the value at the current cursor position
+* Customizing curve colors
 

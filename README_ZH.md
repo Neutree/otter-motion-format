@@ -154,7 +154,11 @@ otter-motion-format "数据文件路径.msgpack"
 * 支持修改曲线颜色
 
 
+## LICENSE 开源协议
 
+[Apache License 2.0](./LICENSE)
+
+简而言之：欢迎使用并提出更改意见，可商用，请保留 LICENSE 文件，如果 fork 修改请注明修改了什么，欢迎提交 PR。
 
 
 

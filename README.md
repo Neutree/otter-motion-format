@@ -1,7 +1,7 @@
 OMF: otter-motion-format
 ========
 
-[中文](./README_CN.md) | English
+[中文](./README_ZH.md) | English
 
 ## Introduction
 
@@ -157,3 +157,9 @@ The curve viewer currently supports:
 * Viewing the value at the current cursor position
 * Customizing curve colors
 
+
+## LICENSE
+
+[Apache License 2.0](./LICENSE)
+
+In short: Feel free to use this project and share suggestions for improvement. Commercial use is allowed and please keep LICENSE file. If you fork and modify it, please document your changes. Pull requests are welcome.

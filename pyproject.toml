@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "otter-motion-format"
+version = "0.1.0"
+description = "Standardized robot motion data format with lightweight visualization tools"
+authors = [
+    {name = "Neucrack", email="CZD666666@gmail.com"},
+]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "msgpack",
+    "PyYAML",
+]
+
+[project.optional-dependencies]
+minimal = []
+viz = [
+    "PySide6",
+    "pyqtgraph",
+]
+all = [
+    "PySide6",
+    "pyqtgraph",
+]
+
+[tool.setuptools]
+packages = ["otter_motion_format"]
+
+[project.scripts]
+otter-motion-format = "otter_motion_format.main:main"
+otter-gmr-to-omf = "otter_motion_format.gmr_conversion:gmr_to_omf_main"
+otter-omf-to-gmr = "otter_motion_format.gmr_conversion:omf_to_gmr_main"

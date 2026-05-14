@@ -47,7 +47,7 @@ basic:
     robot: agibot_x2 # 建议 厂商+型号
     date: 2026-05-13 00:00:00
     joint_names: ["left_hip_pitch", ..., "waist_yaw"] # 关节名，后面的数据严格对应这个顺序
-    joint_dims: [1, ...., 1]
+    joint_dims: [1, ...., 1] # 每个关节的维度，对于电机一般都是 1，对于人体数据是 3
     link_names: ["left_ankle_link"]
     imu_names: ["base", "torso"]
     time_names: ["dt", "model_run"]
@@ -57,7 +57,7 @@ basic:
 `target/model_target/actual`数据，根据`data_names`可以加多种数据：
 
 ```yaml
-target/model_target/actual:
+target/model_target/actual: # 和 basic.data_names 相同，推荐优先使用 target 和 actual
     fps: 50
     length: 600 # 数据总长
     root_pos: [[0.0, 0.0, 0.0], ...] # root 节点世界坐标系下的位移，单位为米
@@ -69,6 +69,7 @@ target/model_target/actual:
         vel: [] # 类 dof_pos， 关节速度
         acc: [] # 类 dof_pos， 关节加速度
         tau: [] # 类 dof_pos， 关节力矩
+        temp: [] # 类 dof_pos， 关节温度
     link:
         pos: []     # shape: (length, link_num, 3(xyz)) 世界坐标系下的位移
         rot: []     # shape: (length, link_num, 4(wxyz)) 世界坐标系下的旋转

@@ -1,0 +1,10 @@
+
+.tmp_test_projects
+__pycache__
+build
+dist
+*.egg-info
+.venv
+
+robot_data_editor_data/robots/*/
+

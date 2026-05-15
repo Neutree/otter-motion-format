@@ -71,17 +71,17 @@ target/model_target/actual: # 和 basic.data_names 相同，推荐优先使用 t
         tau: [] # 类 dof_pos， 关节力矩
         temp: [] # 类 dof_pos， 关节温度
     link:
-        pos: []     # shape: (length, link_num, 3(xyz)) 世界坐标系下的位移
-        rot: []     # shape: (length, link_num, 4(wxyz)) 世界坐标系下的旋转
-        lin_vel: [] # shape: (length, link_num, 3(xyz)) 世界坐标系下的线速度
-        ang_vel: [] # shape: (length, link_num, 3(wx,wy,wz)) 世界坐标系下的角速度
+        pos: []     # shape: (length, len(link_names), 3(xyz)) 世界坐标系下的位移
+        rot: []     # shape: (length, len(link_names), 4(wxyz)) 世界坐标系下的旋转
+        lin_vel: [] # shape: (length, len(link_names), 3(xyz)) 世界坐标系下的线速度
+        ang_vel: [] # shape: (length, len(link_names), 3(wx,wy,wz)) 世界坐标系下的角速度
     imu:
-        pos: []  # shape: (length, link_num, 3(xyz)) 世界坐标系下的位移
-        rot: []  # shape: (length, link_num, 4(wxyz)) 世界坐标系下的旋转
-        gyro: [] # shape: (length, link_num, 3(xyz)) 陀螺仪角速度
-        acc: []  # shape: (length, link_num, 3(xyz)) 加速度
+        pos: []  # shape: (length, len(imu_names), 3(xyz)) 世界坐标系下的位移
+        rot: []  # shape: (length, len(imu_names), 4(wxyz)) 世界坐标系下的旋转
+        gyro: [] # shape: (length, len(imu_names), 3(xyz)) 陀螺仪角速度
+        acc: []  # shape: (length, len(imu_names), 3(xyz)) 加速度
         lin_vel: [] # shape: (length, link_num, 3(xyz)) 线速度，可选
-    time: [] # shape: (len(time_names), length) 一般用来记录运行时的相关耗时
+    time: [] # shape: (length, len(time_names) ) 一般用来记录运行时的相关耗时
 ```
 
 

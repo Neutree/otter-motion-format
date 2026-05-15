@@ -43,6 +43,21 @@ def _as_float_array(values: Any, width: int | None = None) -> np.ndarray:
 	return np.asarray(array, dtype=np.float64)
 
 
+def _normalize_time_array(values: Any, *, time_name_count: int = 0) -> np.ndarray:
+	array = np.asarray(values, dtype=np.float64)
+	if array.size == 0:
+		return np.zeros((0, max(int(time_name_count), 0)), dtype=np.float64)
+	if array.ndim == 1:
+		if time_name_count not in (0, 1):
+			raise ValueError(f"time must have {time_name_count} columns, got 1")
+		return array.reshape((-1, 1))
+	if array.ndim != 2:
+		raise ValueError(f"time must be a 1D or 2D array, got shape {array.shape}")
+	if time_name_count > 0 and array.shape[1] != time_name_count:
+		raise ValueError(f"time must have {time_name_count} columns, got {array.shape[1]}")
+	return array
+
+
 def _quaternion_wxyz_to_euler_xyz(quaternion_wxyz: np.ndarray) -> np.ndarray:
 	w, x, y, z = np.asarray(quaternion_wxyz, dtype=np.float64)
 	sinr_cosp = 2.0 * (w * x + y * z)
@@ -256,16 +271,27 @@ class OMF:
 			self._validate_section(data_name, section)
 
 	def _normalize_section(self, section: dict[str, Any]) -> None:
+		time_values = _normalize_time_array(
+			section.get("time", []),
+			time_name_count=len(self.basic.get("time_names", [])),
+		)
+		section["time"] = time_values.tolist() if time_values.size > 0 else []
 		section["fps"] = int(section.get("fps", 0) or 0)
 		computed_length = self._section_length(section)
 		section["length"] = max(int(section.get("length", 0) or 0), computed_length)
 
 	def _section_length(self, section: dict[str, Any]) -> int:
 		candidates = []
-		for key in ("root_pos", "root_rot", "time"):
+		for key in ("root_pos", "root_rot"):
 			value = section.get(key, [])
 			if isinstance(value, (list, np.ndarray)):
 				candidates.append(len(value))
+		time_values = _normalize_time_array(
+			section.get("time", []),
+			time_name_count=len(self.basic.get("time_names", [])),
+		)
+		if time_values.size > 0:
+			candidates.append(time_values.shape[0])
 		for group_name in ("joint", "link", "imu"):
 			group = section.get(group_name, {})
 			for value in group.values():
@@ -281,6 +307,9 @@ class OMF:
 			value = section.get(key, [])
 			if len(value) not in (0, length):
 				raise ValueError(f"{data_name}.{key} length mismatch: expected 0 or {length}, got {len(value)}")
+		time_values = _normalize_time_array(section.get("time", []), time_name_count=len(self.basic.get("time_names", [])))
+		if time_values.shape[0] not in (0, length):
+			raise ValueError(f"{data_name}.time length mismatch: expected 0 or {length}, got {time_values.shape[0]}")
 		for group_name, key_specs in {
 			"joint": ("pos", "vel", "acc", "tau"),
 			"link": ("pos", "rot", "lin_vel", "ang_vel"),
@@ -526,12 +555,11 @@ class OMF:
 						"x_values": x_values,
 					})
 
-		time_values = np.asarray(section.get("time", []), dtype=np.float64)
+		time_values = _normalize_time_array(
+			section.get("time", []),
+			time_name_count=len(time_names),
+		)
 		if time_values.size > 0:
-			if time_values.ndim == 2 and time_values.shape[0] == len(time_names) and time_values.shape[1] == length:
-				time_values = time_values.T
-			elif time_values.ndim == 1:
-				time_values = time_values.reshape((-1, 1))
 			inferred_names = time_names if time_values.shape[1] == len(time_names) else [f"time_{index}" for index in range(time_values.shape[1])]
 			for time_index, time_name in enumerate(inferred_names):
 				channels.append({

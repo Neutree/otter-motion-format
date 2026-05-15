@@ -72,17 +72,17 @@ target/model_target/actual: # same as basic.data_names, recommend use target and
         tau: [] # Same format as joint.pos, joint torques
         temp: [] # Same format as joint.pos, joint temperature
     link:
-        pos: []     # shape: (length, link_num, 3(xyz)) Position in the world coordinate system
-        rot: []     # shape: (length, link_num, 4(wxyz)) Rotation in the world coordinate system
-        lin_vel: [] # shape: (length, link_num, 3(xyz)) Linear velocity in the world coordinate system
-        ang_vel: [] # shape: (length, link_num, 3(wx,wy,wz)) Angular velocity in the world coordinate system
+        pos: []     # shape: (length, len(link_names), 3(xyz)) Position in the world coordinate system
+        rot: []     # shape: (length, len(link_names), 4(wxyz)) Rotation in the world coordinate system
+        lin_vel: [] # shape: (length, len(link_names), 3(xyz)) Linear velocity in the world coordinate system
+        ang_vel: [] # shape: (length, len(link_names), 3(wx,wy,wz)) Angular velocity in the world coordinate system
     imu:
-        pos: []     # shape: (length, link_num, 3(xyz)) Position in the world coordinate system
-        rot: []     # shape: (length, link_num, 4(wxyz)) Rotation in the world coordinate system
-        gyro: []    # shape: (length, link_num, 3(xyz)) Gyroscope angular velocity
-        acc: []     # shape: (length, link_num, 3(xyz)) Acceleration
-        lin_vel: [] # shape: (length, link_num, 3(xyz)) Linear velocity, optional
-    time: [] # shape: (len(time_names), length); typically used to record execution timings
+        pos: []     # shape: (length, len(imu_names), 3(xyz)) Position in the world coordinate system
+        rot: []     # shape: (length, len(imu_names), 4(wxyz)) Rotation in the world coordinate system
+        gyro: []    # shape: (length, len(imu_names), 3(xyz)) Gyroscope angular velocity
+        acc: []     # shape: (length, len(imu_names), 3(xyz)) Acceleration
+        lin_vel: [] # shape: (length, len(imu_names), 3(xyz)) Linear velocity, optional
+    time: [] # shape: (length, len(time_names)); typically used to record execution timings
 ```
 
 ## Storage Formats

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "otter-motion-format"
-version = "0.1.0"
+version = "0.1.1"
 description = "Standardized robot motion data format with lightweight visualization tools"
 authors = [
     {name = "Neucrack", email="CZD666666@gmail.com"},

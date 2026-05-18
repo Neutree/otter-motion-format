@@ -8,6 +8,7 @@ from typing import Any
 import msgpack
 import numpy as np
 import yaml
+from datetime import datetime
 
 
 def _deep_convert_for_storage(value: Any) -> Any:
@@ -16,7 +17,13 @@ def _deep_convert_for_storage(value: Any) -> Any:
 	if isinstance(value, np.generic):
 		return value.item()
 	if isinstance(value, dict):
-		return {key: _deep_convert_for_storage(sub_value) for key, sub_value in value.items()}
+		kv = {}
+		for key, sub_value in value.items():
+			if key == "date" and isinstance(sub_value, datetime):
+				kv[key] = sub_value.strftime("%Y%m%dT%H:%M:%S.%f")
+			else:
+				kv[key] = _deep_convert_for_storage(sub_value)
+		return kv
 	if isinstance(value, (list, tuple)):
 		return [_deep_convert_for_storage(item) for item in value]
 	return value
@@ -58,8 +65,59 @@ def _normalize_time_array(values: Any, *, time_name_count: int = 0) -> np.ndarra
 	return array
 
 
-def _quaternion_wxyz_to_euler_xyz(quaternion_wxyz: np.ndarray) -> np.ndarray:
-	w, x, y, z = np.asarray(quaternion_wxyz, dtype=np.float64)
+def _resample_linear_array(values: np.ndarray, source_times: np.ndarray, target_times: np.ndarray) -> np.ndarray:
+	values = np.asarray(values, dtype=np.float64)
+	if values.shape[0] == 0:
+		return values.copy()
+	if target_times.size == 0:
+		return np.zeros((0, *values.shape[1:]), dtype=np.float64)
+	if values.shape[0] == 1:
+		return np.repeat(values[:1], target_times.size, axis=0)
+	flat_values = values.reshape((values.shape[0], -1))
+	resampled = np.empty((target_times.size, flat_values.shape[1]), dtype=np.float64)
+	for column in range(flat_values.shape[1]):
+		resampled[:, column] = np.interp(
+			target_times,
+			source_times,
+			flat_values[:, column],
+			left=flat_values[0, column],
+			right=flat_values[-1, column],
+		)
+	return resampled.reshape((target_times.size, *values.shape[1:]))
+
+
+def _resample_quaternion_array(values: np.ndarray, source_times: np.ndarray, target_times: np.ndarray) -> np.ndarray:
+	values = np.asarray(values, dtype=np.float64)
+	if values.shape[0] == 0:
+		return values.copy()
+	if target_times.size == 0:
+		return np.zeros((0, *values.shape[1:]), dtype=np.float64)
+	groups = values.reshape((values.shape[0], -1, 4)).copy()
+	if groups.shape[0] == 1:
+		result = np.repeat(groups[:1], target_times.size, axis=0)
+	else:
+		for group_index in range(groups.shape[1]):
+			for frame_index in range(1, groups.shape[0]):
+				if float(np.dot(groups[frame_index - 1, group_index], groups[frame_index, group_index])) < 0.0:
+					groups[frame_index, group_index] = -groups[frame_index, group_index]
+		result = np.empty((target_times.size, groups.shape[1], 4), dtype=np.float64)
+		for group_index in range(groups.shape[1]):
+			for component_index in range(4):
+				result[:, group_index, component_index] = np.interp(
+					target_times,
+					source_times,
+					groups[:, group_index, component_index],
+					left=groups[0, group_index, component_index],
+					right=groups[-1, group_index, component_index],
+				)
+	norms = np.linalg.norm(result, axis=2, keepdims=True)
+	norms[norms <= 1e-12] = 1.0
+	result = result / norms
+	return result.reshape((target_times.size, *values.shape[1:]))
+
+
+def _quaternion_xyzw_to_euler_xyz(quaternion_xyzw: np.ndarray) -> np.ndarray:
+	x, y, z, w = np.asarray(quaternion_xyzw, dtype=np.float64)
 	sinr_cosp = 2.0 * (w * x + y * z)
 	cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
 	roll = np.arctan2(sinr_cosp, cosr_cosp)
@@ -73,14 +131,14 @@ def _quaternion_wxyz_to_euler_xyz(quaternion_wxyz: np.ndarray) -> np.ndarray:
 	return np.array([roll, pitch, yaw], dtype=np.float64)
 
 
-def _quaternion_wxyz_to_rotvec(quaternion_wxyz: np.ndarray) -> np.ndarray:
-	quaternion_wxyz = np.asarray(quaternion_wxyz, dtype=np.float64)
-	norm = np.linalg.norm(quaternion_wxyz)
+def _quaternion_xyzw_to_rotvec(quaternion_xyzw: np.ndarray) -> np.ndarray:
+	quaternion_xyzw = np.asarray(quaternion_xyzw, dtype=np.float64)
+	norm = np.linalg.norm(quaternion_xyzw)
 	if norm <= 1e-12:
 		return np.zeros(3, dtype=np.float64)
-	quaternion_wxyz = quaternion_wxyz / norm
-	w = float(np.clip(quaternion_wxyz[0], -1.0, 1.0))
-	xyz = quaternion_wxyz[1:]
+	quaternion_xyzw = quaternion_xyzw / norm
+	xyz = quaternion_xyzw[:3]
+	w = float(np.clip(quaternion_xyzw[3], -1.0, 1.0))
 	angle = 2.0 * np.arccos(w)
 	sin_half = np.sqrt(max(0.0, 1.0 - w * w))
 	if sin_half <= 1e-12:
@@ -88,6 +146,16 @@ def _quaternion_wxyz_to_rotvec(quaternion_wxyz: np.ndarray) -> np.ndarray:
 	axis = xyz / sin_half
 	return axis * angle
 
+def msgpack_encode_datetime(obj):
+    if isinstance(obj, datetime):
+        return obj.strftime("%Y%m%dT%H:%M:%S.%f")
+    return obj
+
+
+# def msgpack_decode_datetime(obj):
+#     if '__datetime__' in obj:
+#         obj = datetime.strptime(obj["as_str"], "%Y%m%dT%H:%M:%S.%f")
+#     return obj
 
 class OMF:
 	VERSION = 1
@@ -105,7 +173,7 @@ class OMF:
 		imu_names: list[str] | None = None,
 		time_names: list[str] | None = None,
 		data_names: list[str] | None = None,
-		date: str | None = None,
+		date: str | datetime | None = None,
 		data: dict[str, Any] | None = None,
 	) -> None:
 		if data is None:
@@ -126,7 +194,7 @@ class OMF:
 				"basic": {
 					"name": resolved_name,
 					"robot": resolved_robot,
-					"date": date,
+					"date": date if isinstance(date, (str, datetime)) else datetime.now(),
 					"joint_names": joint_names,
 					"joint_dims": joint_dims,
 					"link_names": list(link_names or []),
@@ -140,7 +208,20 @@ class OMF:
 		else:
 			self.data = _deep_copy_data(data)
 		self._ensure_defaults()
+		self._ensure_date_as_datetime()
 		self.validate()
+
+	def _ensure_date_as_datetime(self) -> None:
+		basic = self.data["basic"]
+		date_value = basic.get("date")
+		if isinstance(date_value, str):
+			try:
+				basic["date"] = datetime.strptime(date_value, "%Y%m%dT%H:%M:%S.%f")
+			except ValueError:
+				print(f"Warning: failed to parse date string: {date_value!r}, setting date to None")
+				basic["date"] = None
+		elif not isinstance(date_value, datetime):
+			basic["date"] = None
 
 	@staticmethod
 	def _empty_section() -> dict[str, Any]:
@@ -154,6 +235,7 @@ class OMF:
 				"vel": [],
 				"acc": [],
 				"tau": [],
+				"temp": [],
 			},
 			"link": {
 				"pos": [],
@@ -311,7 +393,7 @@ class OMF:
 		if time_values.shape[0] not in (0, length):
 			raise ValueError(f"{data_name}.time length mismatch: expected 0 or {length}, got {time_values.shape[0]}")
 		for group_name, key_specs in {
-			"joint": ("pos", "vel", "acc", "tau"),
+			"joint": ("pos", "vel", "acc", "tau", "temp"),
 			"link": ("pos", "rot", "lin_vel", "ang_vel"),
 			"imu": ("pos", "rot", "gyro", "acc", "lin_vel"),
 		}.items():
@@ -327,6 +409,8 @@ class OMF:
 		self.validate()
 		lines = [
 			f"OMF(name={self.name!r}, robot={self.basic.get('robot', '')!r})",
+			f"  version: {self.data.get('version')}",
+			f"  date: {self.basic.get('date')}",
 			f"  joints: {len(self.basic.get('joint_names', []))}",
 			f"  links: {len(self.basic.get('link_names', []))}",
 			f"  imus: {len(self.basic.get('imu_names', []))}",
@@ -348,7 +432,7 @@ class OMF:
 		payload = _deep_convert_for_storage(self.data)
 		suffix = path.suffix.lower()
 		if suffix == ".msgpack":
-			packed = msgpack.packb(payload, use_bin_type=True)
+			packed = msgpack.packb(payload, default=msgpack_encode_datetime, use_bin_type=True)
 			path.write_bytes(packed)
 			return
 		if suffix in {".yaml", ".yml"}:
@@ -386,7 +470,70 @@ class OMF:
 			sections=sections,
 			preselected=preselected,
 			layer_styles=self._default_layer_styles(),
+			raw_data=self.to_dict(),
 		)
+
+	def resampled(self, target_fps: int | str = "max") -> "OMF":
+		self.validate()
+		if target_fps == "max":
+			resolved_fps = max((int(self.data_section(data_name).get("fps", 0) or 0) for data_name in self.data_names), default=0)
+		else:
+			resolved_fps = int(target_fps)
+		if resolved_fps <= 0:
+			return self.clone()
+
+		result = self.clone()
+		joint_total_dim = int(sum(result.basic.get("joint_dims", [])))
+		link_count = len(result.basic.get("link_names", []))
+		imu_count = len(result.basic.get("imu_names", []))
+		time_name_count = len(result.basic.get("time_names", []))
+
+		for data_name in result.data_names:
+			section = result.data_section(data_name)
+			length = int(section.get("length", 0) or 0)
+			source_fps = int(section.get("fps", 0) or 0)
+			if length <= 0 or source_fps <= 0 or source_fps == resolved_fps:
+				continue
+			duration = float(length - 1) / float(max(source_fps, 1))
+			target_length = max(int(round(duration * resolved_fps)) + 1, 1)
+			source_times = np.arange(length, dtype=np.float64) / float(max(source_fps, 1))
+			target_times = np.arange(target_length, dtype=np.float64) / float(resolved_fps)
+
+			root_pos = _as_float_array(section.get("root_pos", []), width=3)
+			section["root_pos"] = _resample_linear_array(root_pos, source_times, target_times).tolist() if root_pos.shape[0] > 0 else []
+
+			root_rot = _as_float_array(section.get("root_rot", []), width=4)
+			section["root_rot"] = _resample_quaternion_array(root_rot, source_times, target_times).tolist() if root_rot.shape[0] > 0 else []
+
+			for field_name in ("pos", "vel", "acc", "tau", "temp"):
+				joint_values = _as_float_array(section.get("joint", {}).get(field_name, []), width=joint_total_dim) if joint_total_dim > 0 else np.zeros((0, 0), dtype=np.float64)
+				section["joint"][field_name] = _resample_linear_array(joint_values, source_times, target_times).tolist() if joint_values.shape[0] > 0 else []
+
+			for field_name, width in (("pos", 3), ("rot", 4), ("lin_vel", 3), ("ang_vel", 3)):
+				values = np.asarray(section.get("link", {}).get(field_name, []), dtype=np.float64)
+				if values.size == 0 or link_count == 0:
+					section["link"][field_name] = []
+					continue
+				values = values.reshape((length, link_count, width))
+				resampled_values = _resample_quaternion_array(values, source_times, target_times) if field_name == "rot" else _resample_linear_array(values, source_times, target_times)
+				section["link"][field_name] = resampled_values.tolist()
+
+			for field_name, width in (("pos", 3), ("rot", 4), ("gyro", 3), ("acc", 3), ("lin_vel", 3)):
+				values = np.asarray(section.get("imu", {}).get(field_name, []), dtype=np.float64)
+				if values.size == 0 or imu_count == 0:
+					section["imu"][field_name] = []
+					continue
+				values = values.reshape((length, imu_count, width))
+				resampled_values = _resample_quaternion_array(values, source_times, target_times) if field_name == "rot" else _resample_linear_array(values, source_times, target_times)
+				section["imu"][field_name] = resampled_values.tolist()
+
+			time_values = _normalize_time_array(section.get("time", []), time_name_count=time_name_count)
+			section["time"] = _resample_linear_array(time_values, source_times, target_times).tolist() if time_values.shape[0] > 0 else []
+			section["fps"] = resolved_fps
+			section["length"] = target_length
+
+		result.validate()
+		return result
 
 	def _default_layer_styles(self) -> dict[str, dict[str, Any]]:
 		styles: dict[str, dict[str, Any]] = {}
@@ -467,7 +614,7 @@ class OMF:
 				for index in range(1, stable_quat.shape[0]):
 					if float(np.dot(stable_quat[index - 1], stable_quat[index])) < 0.0:
 						stable_quat[index] = -stable_quat[index]
-				rotvec = np.asarray([_quaternion_wxyz_to_rotvec(quat) for quat in stable_quat], dtype=np.float64)
+				rotvec = np.asarray([_quaternion_xyzw_to_rotvec(quat) for quat in stable_quat], dtype=np.float64)
 				for axis_index, axis_name in enumerate(("x", "y", "z")):
 					channels.append({
 						"key": f"{data_name}.root_rot.rotvec.{axis_name}",
@@ -476,7 +623,7 @@ class OMF:
 						"x_values": x_values,
 					})
 			if rot_format in {None, "both", "euler"}:
-				euler = np.asarray([_quaternion_wxyz_to_euler_xyz(quat) for quat in root_rot], dtype=np.float64)
+				euler = np.asarray([_quaternion_xyzw_to_euler_xyz(quat) for quat in root_rot], dtype=np.float64)
 				euler[:, 2] = np.unwrap(euler[:, 2]) if euler.shape[0] > 1 else euler[:, 2]
 				for axis_index, axis_name in enumerate(("roll", "pitch", "yaw")):
 					channels.append({
@@ -488,7 +635,7 @@ class OMF:
 
 		joint_group = section.get("joint", {})
 		joint_total_dim = int(sum(joint_dims))
-		for field_name in ("pos", "vel", "acc", "tau"):
+		for field_name in ("pos", "vel", "acc", "tau", "temp"):
 			values = _as_float_array(joint_group.get(field_name, []), width=joint_total_dim) if joint_total_dim > 0 else np.zeros((0, 0), dtype=np.float64)
 			if values.shape[0] == 0:
 				continue
@@ -515,7 +662,7 @@ class OMF:
 		link_group = section.get("link", {})
 		link_specs = {
 			"pos": (3, ("x", "y", "z")),
-			"rot": (4, ("w", "x", "y", "z")),
+			"rot": (4, ("x", "y", "z", "w")),
 			"lin_vel": (3, ("x", "y", "z")),
 			"ang_vel": (3, ("x", "y", "z")),
 		}
@@ -536,7 +683,7 @@ class OMF:
 		imu_group = section.get("imu", {})
 		imu_specs = {
 			"pos": (3, ("x", "y", "z")),
-			"rot": (4, ("w", "x", "y", "z")),
+			"rot": (4, ("x", "y", "z", "w")),
 			"gyro": (3, ("x", "y", "z")),
 			"acc": (3, ("x", "y", "z")),
 			"lin_vel": (3, ("x", "y", "z")),
@@ -572,10 +719,11 @@ class OMF:
 		return channels
 
 
-def load(path: str | Path) -> OMF:
+def load(path: str | Path, *, resample_fps: int | str | None = None) -> OMF:
 	path = Path(path)
 	suffix = path.suffix.lower()
 	if suffix == ".msgpack":
+		# data = msgpack.unpackb(path.read_bytes(), object_hook=msgpack_decode_datetime, raw=False)
 		data = msgpack.unpackb(path.read_bytes(), raw=False)
 	elif suffix in {".yaml", ".yml"}:
 		data = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -585,4 +733,7 @@ def load(path: str | Path) -> OMF:
 		raise ValueError(f"Unsupported input format: {suffix}")
 	if not isinstance(data, dict):
 		raise ValueError("OMF payload must be a dict")
-	return OMF(data=data)
+	motion = OMF(data=data)
+	if resample_fps is not None:
+		return motion.resampled(resample_fps)
+	return motion

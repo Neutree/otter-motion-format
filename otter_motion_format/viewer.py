@@ -62,6 +62,7 @@ class ChannelListWidget(QtWidgets.QWidget):
 	VALUE_COLUMN = 0
 	COLOR_COLUMN = 1
 	NAME_COLUMN = 2
+	VALUE_COLUMN_WIDTH = 112
 
 	def __init__(self, title: str, parent: QtWidgets.QWidget | None = None) -> None:
 		super().__init__(parent)
@@ -72,6 +73,7 @@ class ChannelListWidget(QtWidgets.QWidget):
 		self._name_items: dict[str, QtWidgets.QTableWidgetItem] = {}
 		self._color_buttons: dict[str, ColorCellButton] = {}
 		self._suspend_item_signal = False
+		self._value_font = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
 
 		layout = QtWidgets.QVBoxLayout(self)
 		layout.setContentsMargins(0, 0, 0, 0)
@@ -103,9 +105,10 @@ class ChannelListWidget(QtWidgets.QWidget):
 		self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
 		self.table.setAlternatingRowColors(True)
 		self.table.horizontalHeader().setStretchLastSection(True)
-		self.table.horizontalHeader().setSectionResizeMode(self.VALUE_COLUMN, QtWidgets.QHeaderView.ResizeToContents)
+		self.table.horizontalHeader().setSectionResizeMode(self.VALUE_COLUMN, QtWidgets.QHeaderView.Fixed)
 		self.table.horizontalHeader().setSectionResizeMode(self.COLOR_COLUMN, QtWidgets.QHeaderView.ResizeToContents)
 		self.table.horizontalHeader().setSectionResizeMode(self.NAME_COLUMN, QtWidgets.QHeaderView.Stretch)
+		self.table.setColumnWidth(self.VALUE_COLUMN, self.VALUE_COLUMN_WIDTH)
 		layout.addWidget(self.table, 1)
 
 		self.search.textChanged.connect(self._apply_filter)
@@ -135,6 +138,7 @@ class ChannelListWidget(QtWidgets.QWidget):
 			value_item = QtWidgets.QTableWidgetItem("")
 			value_item.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable)
 			value_item.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+			value_item.setFont(self._value_font)
 			self.table.setItem(row, self.VALUE_COLUMN, value_item)
 			self._value_items[channel.key] = value_item
 
@@ -241,6 +245,7 @@ class OMFViewer(QtWidgets.QWidget):
 		sections: dict[str, list[ChannelSpec]],
 		preselected: dict[str, set[str]] | None = None,
 		layer_styles: dict[str, LayerStyleSpec] | dict[str, dict[str, object]] | None = None,
+		raw_data: dict[str, object] | None = None,
 		parent: QtWidgets.QWidget | None = None,
 	) -> None:
 		super().__init__(parent)
@@ -256,6 +261,9 @@ class OMFViewer(QtWidgets.QWidget):
 		self._channel_lists: dict[str, ChannelListWidget] = {}
 		self._layer_styles = self._normalize_layer_styles(layer_styles or {}, list(sections.keys()))
 		self._channel_colors: dict[str, str] = {}
+		self._raw_data = raw_data or {}
+		self._has_rendered_plot = False
+		self._hover_detail_font = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
 
 		pg.setConfigOptions(antialias=False)
 
@@ -263,9 +271,25 @@ class OMFViewer(QtWidgets.QWidget):
 		root_layout.setContentsMargins(8, 8, 8, 8)
 		root_layout.setSpacing(8)
 
+		self.splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+		self.splitter.setChildrenCollapsible(False)
+		root_layout.addWidget(self.splitter, 1)
+
+		left_panel = QtWidgets.QWidget()
+		left_layout = QtWidgets.QVBoxLayout(left_panel)
+		left_layout.setContentsMargins(0, 0, 0, 0)
+		left_layout.setSpacing(6)
+		left_toolbar = QtWidgets.QHBoxLayout()
+		left_layout.addLayout(left_toolbar)
+		self.raw_toggle_button = QtWidgets.QPushButton("Raw Data")
+		self.raw_toggle_button.setCheckable(True)
+		self.raw_toggle_button.toggled.connect(self._toggle_raw_view)
+		left_toolbar.addWidget(self.raw_toggle_button)
+		left_toolbar.addStretch(1)
+
 		self.tabs = QtWidgets.QTabWidget()
-		self.tabs.setMinimumWidth(420)
-		root_layout.addWidget(self.tabs, 0)
+		self.tabs.setMinimumWidth(360)
+		left_layout.addWidget(self.tabs, 1)
 
 		for section_name, section_channels in sections.items():
 			for channel in section_channels:
@@ -283,14 +307,24 @@ class OMFViewer(QtWidgets.QWidget):
 			self._channel_lists[section_name] = list_widget
 			self.tabs.addTab(list_widget, section_name)
 
-		right_panel = QtWidgets.QVBoxLayout()
-		root_layout.addLayout(right_panel, 1)
+		right_panel = QtWidgets.QWidget()
+		right_layout = QtWidgets.QVBoxLayout(right_panel)
+		right_layout.setContentsMargins(0, 0, 0, 0)
+		right_layout.setSpacing(6)
+
+		self.right_stack = QtWidgets.QStackedWidget()
+		right_layout.addWidget(self.right_stack, 1)
+
+		plot_page = QtWidgets.QWidget()
+		plot_layout = QtWidgets.QVBoxLayout(plot_page)
+		plot_layout.setContentsMargins(0, 0, 0, 0)
+		plot_layout.setSpacing(6)
 
 		help_label = QtWidgets.QLabel("Mouse drag to pan, wheel to zoom. Checked channels from all tabs are drawn together.")
-		right_panel.addWidget(help_label)
+		plot_layout.addWidget(help_label)
 
 		self.hover_label = QtWidgets.QLabel("Move the mouse over the plot to inspect the current time.")
-		right_panel.addWidget(self.hover_label)
+		plot_layout.addWidget(self.hover_label)
 
 		self.plot = pg.PlotWidget()
 		self.plot.setBackground("#0f1720")
@@ -301,11 +335,66 @@ class OMFViewer(QtWidgets.QWidget):
 		self.hover_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#f8fafc", width=1, style=QtCore.Qt.DashLine))
 		self.hover_line.hide()
 		self.plot.addItem(self.hover_line)
-		right_panel.addWidget(self.plot, 1)
+		plot_layout.addWidget(self.plot, 1)
+
+		self.hover_detail_label = QtWidgets.QLabel("")
+		self.hover_detail_label.setFont(self._hover_detail_font)
+		self.hover_detail_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+		self.hover_detail_label.setMinimumHeight(44)
+		self.hover_detail_label.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+		self.hover_detail_label.setStyleSheet("QLabel { background: #111827; color: #dbeafe; border: 1px solid #263244; padding: 6px; }")
+		plot_layout.addWidget(self.hover_detail_label)
+
+		self.raw_tree = QtWidgets.QTreeWidget()
+		self.raw_tree.setColumnCount(2)
+		self.raw_tree.setHeaderLabels(["Key", "Value"])
+		self.raw_tree.header().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+		self.raw_tree.header().setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
+		self.raw_tree.setAlternatingRowColors(True)
+		self.raw_tree.setUniformRowHeights(True)
+		self._populate_raw_tree()
+
+		self.right_stack.addWidget(plot_page)
+		self.right_stack.addWidget(self.raw_tree)
+		self.right_stack.setCurrentWidget(plot_page)
+
+		self.splitter.addWidget(left_panel)
+		self.splitter.addWidget(right_panel)
+		self.splitter.setStretchFactor(0, 0)
+		self.splitter.setStretchFactor(1, 1)
+		self.splitter.setSizes([420, 1020])
 		self._hover_proxy = pg.SignalProxy(self.plot.scene().sigMouseMoved, rateLimit=60, slot=self._on_mouse_moved)
 
 		self.tabs.currentChanged.connect(self._refresh_plot)
 		self._refresh_plot()
+
+	def _toggle_raw_view(self, checked: bool) -> None:
+		self.right_stack.setCurrentIndex(1 if checked else 0)
+		self.raw_toggle_button.setText("Show Plot" if checked else "Raw Data")
+
+	def _populate_raw_tree(self) -> None:
+		self.raw_tree.clear()
+		for key, value in self._raw_data.items():
+			item = self._build_tree_item(key, value)
+			item.setExpanded(True)
+			self.raw_tree.addTopLevelItem(item)
+
+	def _build_tree_item(self, key: str, value: object) -> QtWidgets.QTreeWidgetItem:
+		item = QtWidgets.QTreeWidgetItem([str(key), self._format_tree_value(value)])
+		if isinstance(value, dict):
+			for child_key, child_value in value.items():
+				item.addChild(self._build_tree_item(str(child_key), child_value))
+		elif isinstance(value, list):
+			for index, child_value in enumerate(value):
+				item.addChild(self._build_tree_item(f"[{index}]", child_value))
+		return item
+
+	def _format_tree_value(self, value: object) -> str:
+		if isinstance(value, dict):
+			return f"{{{len(value)} items}}"
+		if isinstance(value, list):
+			return f"[{len(value)} items]"
+		return str(value)
 
 	def _normalize_layer_styles(
 		self,
@@ -345,6 +434,8 @@ class OMFViewer(QtWidgets.QWidget):
 		return palette[zlib.crc32(channel_key.encode("utf-8")) % len(palette)]
 
 	def _refresh_plot(self, *_args) -> None:
+		preserve_view = self._has_rendered_plot and self.right_stack.currentIndex() == 0
+		view_range = self.plot.getPlotItem().viewRange() if preserve_view else None
 		self.plot.clear()
 		self.plot.addItem(self.hover_line)
 		self.hover_line.hide()
@@ -363,6 +454,7 @@ class OMFViewer(QtWidgets.QWidget):
 					selected_channels.append(channel)
 		if not selected_channels:
 			self.hover_label.setText("Move the mouse over the plot to inspect the current time.")
+			self.hover_detail_label.setText("")
 			return
 
 		x_min = float("inf")
@@ -385,9 +477,14 @@ class OMFViewer(QtWidgets.QWidget):
 			if channel.x_values.size > 0:
 				x_min = min(x_min, float(channel.x_values[0]))
 				x_max = max(x_max, float(channel.x_values[-1]))
-		if np.isfinite(x_min) and np.isfinite(x_max):
+		if preserve_view and view_range is not None:
+			self.plot.setXRange(view_range[0][0], view_range[0][1], padding=0.0)
+			self.plot.setYRange(view_range[1][0], view_range[1][1], padding=0.0)
+		elif np.isfinite(x_min) and np.isfinite(x_max):
 			self.plot.setXRange(x_min, x_max if x_max > x_min else x_min + 1.0, padding=0.01)
 		self.hover_label.setText("Move the mouse over the plot to inspect the current time.")
+		self.hover_detail_label.setText("")
+		self._has_rendered_plot = True
 
 	def _build_pen(self, color: str, style: LayerStyleSpec, highlighted: bool) -> QtGui.QPen:
 		return pg.mkPen(
@@ -410,6 +507,7 @@ class OMFViewer(QtWidgets.QWidget):
 			for list_widget in self._channel_lists.values():
 				list_widget.clear_values()
 			self.hover_label.setText("Move the mouse over the plot to inspect the current time.")
+			self.hover_detail_label.setText("")
 			return
 		scene_pos = event[0]
 		if not self.plot.sceneBoundingRect().contains(scene_pos):
@@ -417,6 +515,7 @@ class OMFViewer(QtWidgets.QWidget):
 			for list_widget in self._channel_lists.values():
 				list_widget.clear_values()
 			self.hover_label.setText("Move the mouse over the plot to inspect the current time.")
+			self.hover_detail_label.setText("")
 			return
 		mouse_point = self.plot.getPlotItem().vb.mapSceneToView(scene_pos)
 		x_value = float(mouse_point.x())
@@ -424,6 +523,7 @@ class OMFViewer(QtWidgets.QWidget):
 		self.hover_line.show()
 		for list_widget in self._channel_lists.values():
 			list_widget.clear_values()
+		layer_frames: dict[str, tuple[int, int]] = {}
 		for channel in self._visible_channels:
 			if channel.x_values.size == 0:
 				continue
@@ -433,7 +533,10 @@ class OMFViewer(QtWidgets.QWidget):
 			elif index > 0 and abs(channel.x_values[index - 1] - x_value) <= abs(channel.x_values[index] - x_value):
 				index -= 1
 			self._channel_lists[channel.layer_name].set_value_text(channel.key, f"{float(channel.values[index]):.6f}")
+			layer_frames.setdefault(channel.layer_name, (index + 1, channel.x_values.size))
 		self.hover_label.setText(f"t = {x_value:.3f}s")
+		detail_lines = [f"{layer_name} {frame_index}/{frame_count}" for layer_name, (frame_index, frame_count) in layer_frames.items()]
+		self.hover_detail_label.setText("\n".join(detail_lines))
 
 
 def show_omf_viewer(
@@ -441,12 +544,13 @@ def show_omf_viewer(
 	sections: dict[str, list[ChannelSpec]],
 	preselected: dict[str, set[str]] | None = None,
 	layer_styles: dict[str, LayerStyleSpec] | dict[str, dict[str, object]] | None = None,
+	raw_data: dict[str, object] | None = None,
 ) -> None:
 	app = QtWidgets.QApplication.instance()
 	owns_app = app is None
 	if app is None:
 		app = QtWidgets.QApplication([])
-	viewer = OMFViewer(title=title, sections=sections, preselected=preselected, layer_styles=layer_styles)
+	viewer = OMFViewer(title=title, sections=sections, preselected=preselected, layer_styles=layer_styles, raw_data=raw_data)
 	viewer.show()
 	viewer.raise_()
 	viewer.activateWindow()

@@ -65,7 +65,7 @@ def convert_gmr_to_omf(
 	section["fps"] = int(float(payload.get("fps", 0) or 0))
 	section["length"] = int(frame_count)
 	section["root_pos"] = root_pos.tolist()
-	section["root_rot"] = root_rot_xyzw[:, [3, 0, 1, 2]].tolist() if root_rot_xyzw.size > 0 else []
+	section["root_rot"] = root_rot_xyzw.tolist() if root_rot_xyzw.size > 0 else []
 	section["joint"]["pos"] = dof_pos.tolist() if dof_pos.size > 0 else []
 	motion.save(omf_path)
 	return omf_path
@@ -87,7 +87,7 @@ def convert_omf_to_gmr(
 	if any(int(dim) != 1 for dim in joint_dims):
 		raise ValueError("OMF to GMR export currently requires joint_dims to be all 1")
 	root_pos = _as_float_array(section.get("root_pos", []), width=3)
-	root_rot_wxyz = _as_float_array(section.get("root_rot", []), width=4)
+	root_rot_xyzw = _as_float_array(section.get("root_rot", []), width=4)
 	joint_pos = np.asarray(section.get("joint", {}).get("pos", []), dtype=np.float64)
 	if joint_pos.ndim == 1:
 		joint_pos = joint_pos.reshape((-1, 1))
@@ -98,7 +98,7 @@ def convert_omf_to_gmr(
 	payload = {
 		"fps": int(section.get("fps", 0) or 0),
 		"root_pos": root_pos,
-		"root_rot": root_rot_wxyz[:, [1, 2, 3, 0]] if root_rot_wxyz.size > 0 else np.zeros((0, 4), dtype=np.float64),
+		"root_rot": root_rot_xyzw if root_rot_xyzw.size > 0 else np.zeros((0, 4), dtype=np.float64),
 		"dof_pos": joint_pos,
 		"joint_names": joint_names,
 	}

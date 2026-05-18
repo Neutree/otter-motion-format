@@ -46,7 +46,7 @@ format: omf
 basic:
     name: walk stright
     robot: agibot_x2 # Recommended format: manufacturer + model
-    date: 2026-05-13 00:00:00
+    date: 2026-05-13T00:00:00.000 # %Y%m%dT%H:%M:%S.%f
     joint_names: ["left_hip_pitch", ..., "waist_yaw"] # Joint names; all subsequent data strictly follows this order
     joint_dims: [1, ...., 1] # joints' dim, for actuator is 1, for person body joint is 3
     link_names: ["left_ankle_link"]
@@ -62,7 +62,7 @@ target/model_target/actual: # same as basic.data_names, recommend use target and
     fps: 50
     length: 600 # Total number of frames
     root_pos: [[0.0, 0.0, 0.0], ...] # Root position in the world coordinate system, in meters
-    root_rot: [[w, x, y, z], ...]    # Root rotation in the world coordinate system, quaternion
+    root_rot: [[x, y, z, w], ...]    # Root rotation in the world coordinate system, quaternion in xyzw order
     joint:
         pos:
             - [1.0, ...] # Joint angles; the number of values for each joint corresponds to dof_dim
@@ -73,12 +73,12 @@ target/model_target/actual: # same as basic.data_names, recommend use target and
         temp: [] # Same format as joint.pos, joint temperature
     link:
         pos: []     # shape: (length, len(link_names), 3(xyz)) Position in the world coordinate system
-        rot: []     # shape: (length, len(link_names), 4(wxyz)) Rotation in the world coordinate system
+        rot: []     # shape: (length, len(link_names), 4(xyzw)) Rotation in the world coordinate system
         lin_vel: [] # shape: (length, len(link_names), 3(xyz)) Linear velocity in the world coordinate system
         ang_vel: [] # shape: (length, len(link_names), 3(wx,wy,wz)) Angular velocity in the world coordinate system
     imu:
         pos: []     # shape: (length, len(imu_names), 3(xyz)) Position in the world coordinate system
-        rot: []     # shape: (length, len(imu_names), 4(wxyz)) Rotation in the world coordinate system
+        rot: []     # shape: (length, len(imu_names), 4(xyzw)) Rotation in the world coordinate system
         gyro: []    # shape: (length, len(imu_names), 3(xyz)) Gyroscope angular velocity
         acc: []     # shape: (length, len(imu_names), 3(xyz)) Acceleration
         lin_vel: [] # shape: (length, len(imu_names), 3(xyz)) Linear velocity, optional

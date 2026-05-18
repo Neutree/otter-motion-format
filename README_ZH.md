@@ -45,7 +45,7 @@ format: omf
 basic:
     name: walk stright
     robot: agibot_x2 # 建议 厂商+型号
-    date: 2026-05-13 00:00:00
+    date: 2026-05-13T00:00:00.000 # %Y%m%dT%H:%M:%S.%f
     joint_names: ["left_hip_pitch", ..., "waist_yaw"] # 关节名，后面的数据严格对应这个顺序
     joint_dims: [1, ...., 1] # 每个关节的维度，对于电机一般都是 1，对于人体数据是 3
     link_names: ["left_ankle_link"]
@@ -61,7 +61,7 @@ target/model_target/actual: # 和 basic.data_names 相同，推荐优先使用 t
     fps: 50
     length: 600 # 数据总长
     root_pos: [[0.0, 0.0, 0.0], ...] # root 节点世界坐标系下的位移，单位为米
-    root_rot: [[w, x, y, z], ...]    # root 节点世界坐标系下的旋转，四元数
+    root_rot: [[x, y, z, w], ...]    # root 节点世界坐标系下的旋转，四元数，使用 xyzw 顺序
     joint:
         pos:
             - [1.0, ...] # 每个关节旋转的角度, 每个关节的值个数和 dof_dim 对应
@@ -72,12 +72,12 @@ target/model_target/actual: # 和 basic.data_names 相同，推荐优先使用 t
         temp: [] # 类 dof_pos， 关节温度
     link:
         pos: []     # shape: (length, len(link_names), 3(xyz)) 世界坐标系下的位移
-        rot: []     # shape: (length, len(link_names), 4(wxyz)) 世界坐标系下的旋转
+        rot: []     # shape: (length, len(link_names), 4(xyzw)) 世界坐标系下的旋转
         lin_vel: [] # shape: (length, len(link_names), 3(xyz)) 世界坐标系下的线速度
         ang_vel: [] # shape: (length, len(link_names), 3(wx,wy,wz)) 世界坐标系下的角速度
     imu:
         pos: []  # shape: (length, len(imu_names), 3(xyz)) 世界坐标系下的位移
-        rot: []  # shape: (length, len(imu_names), 4(wxyz)) 世界坐标系下的旋转
+        rot: []  # shape: (length, len(imu_names), 4(xyzw)) 世界坐标系下的旋转
         gyro: [] # shape: (length, len(imu_names), 3(xyz)) 陀螺仪角速度
         acc: []  # shape: (length, len(imu_names), 3(xyz)) 加速度
         lin_vel: [] # shape: (length, link_num, 3(xyz)) 线速度，可选

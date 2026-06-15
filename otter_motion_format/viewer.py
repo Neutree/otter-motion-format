@@ -24,6 +24,22 @@ class LayerStyleSpec:
 	width: float = 2.0
 
 
+def build_channel_specs(section_payload: dict[str, list[dict[str, object]]]) -> dict[str, list[ChannelSpec]]:
+	sections: dict[str, list[ChannelSpec]] = {}
+	for section_name, channels in section_payload.items():
+		sections[section_name] = [
+			ChannelSpec(
+				key=str(channel["key"]),
+				label=str(channel["label"]),
+				values=np.asarray(channel["values"], dtype=np.float64),
+				x_values=np.asarray(channel["x_values"], dtype=np.float64),
+				layer_name=section_name,
+			)
+			for channel in channels
+		]
+	return sections
+
+
 class ColorCellButton(QtWidgets.QPushButton):
 	colorChanged = QtCore.Signal(str)
 
@@ -249,6 +265,7 @@ class OMFViewer(QtWidgets.QWidget):
 		parent: QtWidgets.QWidget | None = None,
 	) -> None:
 		super().__init__(parent)
+		self.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
 		self.setWindowTitle(title)
 		self.resize(1440, 900)
 		self._curves: dict[str, pg.PlotDataItem] = {}
@@ -264,6 +281,8 @@ class OMFViewer(QtWidgets.QWidget):
 		self._raw_data = raw_data or {}
 		self._has_rendered_plot = False
 		self._hover_detail_font = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
+		self._follow_latest_enabled = False
+		self._latest_x_value: float | None = None
 
 		pg.setConfigOptions(antialias=False)
 
@@ -285,27 +304,17 @@ class OMFViewer(QtWidgets.QWidget):
 		self.raw_toggle_button.setCheckable(True)
 		self.raw_toggle_button.toggled.connect(self._toggle_raw_view)
 		left_toolbar.addWidget(self.raw_toggle_button)
+		self.follow_latest_button = QtWidgets.QPushButton("Follow Latest")
+		self.follow_latest_button.setCheckable(True)
+		self.follow_latest_button.setToolTip("Keep the newest frame anchored at its current on-screen position while live data grows.")
+		self.follow_latest_button.toggled.connect(self._on_follow_latest_toggled)
+		left_toolbar.addWidget(self.follow_latest_button)
 		left_toolbar.addStretch(1)
 
 		self.tabs = QtWidgets.QTabWidget()
 		self.tabs.setMinimumWidth(360)
 		left_layout.addWidget(self.tabs, 1)
-
-		for section_name, section_channels in sections.items():
-			for channel in section_channels:
-				self._channel_colors.setdefault(channel.key, self._default_color_for_channel(channel.key))
-			list_widget = ChannelListWidget(section_name)
-			list_widget.set_channels(
-				section_channels,
-				preselected=(preselected or {}).get(section_name),
-				colors={channel.key: self._channel_colors[channel.key] for channel in section_channels},
-			)
-			list_widget.selectionChanged.connect(self._refresh_plot)
-			list_widget.currentKeyChanged.connect(lambda key, section_name=section_name: self._on_current_key_changed(section_name, key))
-			list_widget.channelColorChanged.connect(self._on_channel_color_changed)
-			self._active_keys[section_name] = list_widget.current_key()
-			self._channel_lists[section_name] = list_widget
-			self.tabs.addTab(list_widget, section_name)
+		self._set_section_tabs(sections, preselected=preselected, preserve_state=False)
 
 		right_panel = QtWidgets.QWidget()
 		right_layout = QtWidgets.QVBoxLayout(right_panel)
@@ -324,6 +333,7 @@ class OMFViewer(QtWidgets.QWidget):
 		plot_layout.addWidget(help_label)
 
 		self.hover_label = QtWidgets.QLabel("Move the mouse over the plot to inspect the current time.")
+		self.hover_label.setMinimumHeight(24)
 		plot_layout.addWidget(self.hover_label)
 
 		self.plot = pg.PlotWidget()
@@ -340,7 +350,9 @@ class OMFViewer(QtWidgets.QWidget):
 		self.hover_detail_label = QtWidgets.QLabel("")
 		self.hover_detail_label.setFont(self._hover_detail_font)
 		self.hover_detail_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-		self.hover_detail_label.setMinimumHeight(44)
+		self.hover_detail_label.setWordWrap(True)
+		self.hover_detail_label.setMinimumHeight(36)
+		self.hover_detail_label.setMaximumHeight(60)
 		self.hover_detail_label.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
 		self.hover_detail_label.setStyleSheet("QLabel { background: #111827; color: #dbeafe; border: 1px solid #263244; padding: 6px; }")
 		plot_layout.addWidget(self.hover_detail_label)
@@ -367,6 +379,114 @@ class OMFViewer(QtWidgets.QWidget):
 
 		self.tabs.currentChanged.connect(self._refresh_plot)
 		self._refresh_plot()
+
+	def _on_follow_latest_toggled(self, checked: bool) -> None:
+		self._follow_latest_enabled = bool(checked)
+
+	def _set_status_text(self, x_value: float | None, layer_frames: dict[str, tuple[int, int]]) -> None:
+		if x_value is not None:
+			self.hover_label.setText(f"t = {x_value:.3f}s")
+		elif not self.hover_label.text().strip():
+			self.hover_label.setText("t = --")
+
+		if layer_frames:
+			detail_lines = [f"{layer_name} {frame_index}/{frame_count}" for layer_name, (frame_index, frame_count) in layer_frames.items()]
+			self.hover_detail_label.setText(" | ".join(detail_lines))
+		elif not self.hover_detail_label.text().strip():
+			self.hover_detail_label.setText("frames: --")
+
+	def _latest_layer_frames(self) -> dict[str, tuple[int, int]]:
+		layer_frames: dict[str, tuple[int, int]] = {}
+		for channel in self._visible_channels:
+			if channel.x_values.size == 0:
+				continue
+			layer_frames[channel.layer_name] = (channel.x_values.size, channel.x_values.size)
+		return layer_frames
+
+	def _capture_ui_state(self) -> tuple[dict[str, set[str]], dict[str, str | None], int]:
+		selected = {section_name: set(list_widget.checked_keys()) for section_name, list_widget in self._channel_lists.items()}
+		active = {section_name: list_widget.current_key() for section_name, list_widget in self._channel_lists.items()}
+		return selected, active, self.tabs.currentIndex()
+
+	def _set_section_tabs(
+		self,
+		sections: dict[str, list[ChannelSpec]],
+		preselected: dict[str, set[str]] | None = None,
+		preserve_state: bool = True,
+	) -> None:
+		selected_state: dict[str, set[str]] = preselected or {}
+		active_state: dict[str, str | None] = {}
+		current_tab_index = 0
+		if preserve_state and self._channel_lists:
+			captured_selected, captured_active, current_tab_index = self._capture_ui_state()
+			if preselected is None:
+				selected_state = captured_selected
+			active_state = captured_active
+
+		self.tabs.blockSignals(True)
+		while self.tabs.count() > 0:
+			widget = self.tabs.widget(0)
+			self.tabs.removeTab(0)
+			if widget is not None:
+				widget.deleteLater()
+
+		self._channel_maps = {
+			section_name: {channel.key: channel for channel in section_channels}
+			for section_name, section_channels in sections.items()
+		}
+		self._channel_lists = {}
+		self._active_keys = {}
+
+		for section_name, section_channels in sections.items():
+			for channel in section_channels:
+				self._channel_colors.setdefault(channel.key, self._default_color_for_channel(channel.key))
+			list_widget = ChannelListWidget(section_name)
+			list_widget.set_channels(
+				section_channels,
+				preselected=selected_state.get(section_name),
+				colors={channel.key: self._channel_colors[channel.key] for channel in section_channels},
+			)
+			list_widget.selectionChanged.connect(self._refresh_plot)
+			list_widget.currentKeyChanged.connect(lambda key, section_name=section_name: self._on_current_key_changed(section_name, key))
+			list_widget.channelColorChanged.connect(self._on_channel_color_changed)
+			desired_active_key = active_state.get(section_name)
+			if desired_active_key is not None:
+				list_widget._select_key(desired_active_key)
+			self._active_keys[section_name] = list_widget.current_key()
+			self._channel_lists[section_name] = list_widget
+			self.tabs.addTab(list_widget, section_name)
+
+		if self.tabs.count() > 0:
+			self.tabs.setCurrentIndex(max(0, min(current_tab_index, self.tabs.count() - 1)))
+		self.tabs.blockSignals(False)
+
+	def set_sections(
+		self,
+		sections: dict[str, list[ChannelSpec]],
+		raw_data: dict[str, object] | None = None,
+		preselected: dict[str, set[str]] | None = None,
+	) -> None:
+		current_keys = {
+			section_name: list(channel_map.keys())
+			for section_name, channel_map in self._channel_maps.items()
+		}
+		new_keys = {
+			section_name: [channel.key for channel in section_channels]
+			for section_name, section_channels in sections.items()
+		}
+		topology_changed = current_keys != new_keys or set(current_keys.keys()) != set(new_keys.keys())
+		if topology_changed:
+			self._set_section_tabs(sections, preselected=preselected, preserve_state=True)
+		else:
+			self._channel_maps = {
+				section_name: {channel.key: channel for channel in section_channels}
+				for section_name, section_channels in sections.items()
+			}
+		if raw_data is not None:
+			self._raw_data = raw_data
+			self._populate_raw_tree()
+		if topology_changed or not self._refresh_plot_in_place():
+			self._refresh_plot()
 
 	def _toggle_raw_view(self, checked: bool) -> None:
 		self.right_stack.setCurrentIndex(1 if checked else 0)
@@ -433,17 +553,7 @@ class OMFViewer(QtWidgets.QWidget):
 		]
 		return palette[zlib.crc32(channel_key.encode("utf-8")) % len(palette)]
 
-	def _refresh_plot(self, *_args) -> None:
-		preserve_view = self._has_rendered_plot and self.right_stack.currentIndex() == 0
-		view_range = self.plot.getPlotItem().viewRange() if preserve_view else None
-		self.plot.clear()
-		self.plot.addItem(self.hover_line)
-		self.hover_line.hide()
-		self._curves.clear()
-		self._visible_channels.clear()
-		for list_widget in self._channel_lists.values():
-			list_widget.clear_values()
-
+	def _selected_channels(self) -> list[ChannelSpec]:
 		selected_channels: list[ChannelSpec] = []
 		for section_name, list_widget in self._channel_lists.items():
 			self._active_keys[section_name] = list_widget.current_key()
@@ -452,17 +562,104 @@ class OMFViewer(QtWidgets.QWidget):
 				channel = channel_map.get(key)
 				if channel is not None:
 					selected_channels.append(channel)
+		return selected_channels
+
+	def _sorted_visible_channels(self, selected_channels: list[ChannelSpec]) -> list[ChannelSpec]:
+		return sorted(
+			selected_channels,
+			key=lambda channel: (channel.key == self._active_keys.get(channel.layer_name), channel.label),
+		)
+
+	def _update_existing_curves(self, sorted_channels: list[ChannelSpec], view_range) -> bool:
+		current_keys = list(self._curves.keys())
+		sorted_keys = [channel.key for channel in sorted_channels]
+		if current_keys != sorted_keys:
+			return False
+
+		follow_anchor_ratio: float | None = None
+		follow_anchor_width: float | None = None
+		if (
+			self._follow_latest_enabled
+			and view_range is not None
+			and self._latest_x_value is not None
+		):
+			x_left, x_right = view_range[0]
+			follow_anchor_width = x_right - x_left
+			if follow_anchor_width > 1e-12:
+				follow_anchor_ratio = (self._latest_x_value - x_left) / follow_anchor_width
+				follow_anchor_ratio = min(1.0, max(0.0, follow_anchor_ratio))
+
+		x_min = float("inf")
+		x_max = float("-inf")
+		for channel in sorted_channels:
+			curve = self._curves.get(channel.key)
+			if curve is None:
+				return False
+			style = self._layer_styles.get(channel.layer_name, LayerStyleSpec())
+			color = self._channel_colors.get(channel.key, self._default_color_for_channel(channel.key))
+			is_active = channel.key == self._active_keys.get(channel.layer_name)
+			curve.setData(channel.x_values, channel.values)
+			curve.setPen(self._build_pen(color, style, is_active))
+			curve.setOpacity(min(1.0, style.opacity + 0.15) if is_active else max(0.24, style.opacity * 0.75))
+			if channel.x_values.size > 0:
+				x_min = min(x_min, float(channel.x_values[0]))
+				x_max = max(x_max, float(channel.x_values[-1]))
+
+		self._visible_channels = sorted_channels
+		self._latest_x_value = x_max if np.isfinite(x_max) else None
+		if (
+			self._follow_latest_enabled
+			and view_range is not None
+			and follow_anchor_ratio is not None
+			and follow_anchor_width is not None
+			and np.isfinite(x_max)
+		):
+			new_x_left = x_max - follow_anchor_ratio * follow_anchor_width
+			new_x_right = new_x_left + follow_anchor_width
+			self.plot.setXRange(new_x_left, new_x_right, padding=0.0)
+			self.plot.setYRange(view_range[1][0], view_range[1][1], padding=0.0)
+		elif view_range is not None:
+			self.plot.setXRange(view_range[0][0], view_range[0][1], padding=0.0)
+			self.plot.setYRange(view_range[1][0], view_range[1][1], padding=0.0)
+		elif np.isfinite(x_min) and np.isfinite(x_max):
+			self.plot.setXRange(x_min, x_max if x_max > x_min else x_min + 1.0, padding=0.01)
+
+		self._set_status_text(self._latest_x_value, self._latest_layer_frames())
+		return True
+
+	def _refresh_plot(self, *_args) -> None:
+		preserve_view = self._has_rendered_plot and self.right_stack.currentIndex() == 0
+		view_range = self.plot.getPlotItem().viewRange() if preserve_view else None
+		follow_anchor_ratio: float | None = None
+		follow_anchor_width: float | None = None
+		if (
+			self._follow_latest_enabled
+			and preserve_view
+			and view_range is not None
+			and self._latest_x_value is not None
+		):
+			x_left, x_right = view_range[0]
+			follow_anchor_width = x_right - x_left
+			if follow_anchor_width > 1e-12:
+				follow_anchor_ratio = (self._latest_x_value - x_left) / follow_anchor_width
+				follow_anchor_ratio = min(1.0, max(0.0, follow_anchor_ratio))
+		self.plot.clear()
+		self.plot.addItem(self.hover_line)
+		self.hover_line.hide()
+		self._curves.clear()
+		self._visible_channels.clear()
+		for list_widget in self._channel_lists.values():
+			list_widget.clear_values()
+
+		selected_channels = self._selected_channels()
 		if not selected_channels:
-			self.hover_label.setText("Move the mouse over the plot to inspect the current time.")
-			self.hover_detail_label.setText("")
+			self.hover_label.setText("No channels selected")
+			self.hover_detail_label.setText("frames: --")
 			return
 
 		x_min = float("inf")
 		x_max = float("-inf")
-		sorted_channels = sorted(
-			selected_channels,
-			key=lambda channel: (channel.key == self._active_keys.get(channel.layer_name), channel.label),
-		)
+		sorted_channels = self._sorted_visible_channels(selected_channels)
 		for channel in sorted_channels:
 			style = self._layer_styles.get(channel.layer_name, LayerStyleSpec())
 			color = self._channel_colors.get(channel.key, self._default_color_for_channel(channel.key))
@@ -477,14 +674,38 @@ class OMFViewer(QtWidgets.QWidget):
 			if channel.x_values.size > 0:
 				x_min = min(x_min, float(channel.x_values[0]))
 				x_max = max(x_max, float(channel.x_values[-1]))
-		if preserve_view and view_range is not None:
+		self._latest_x_value = x_max if np.isfinite(x_max) else None
+		if (
+			self._follow_latest_enabled
+			and preserve_view
+			and view_range is not None
+			and follow_anchor_ratio is not None
+			and follow_anchor_width is not None
+			and np.isfinite(x_max)
+		):
+			new_x_left = x_max - follow_anchor_ratio * follow_anchor_width
+			new_x_right = new_x_left + follow_anchor_width
+			self.plot.setXRange(new_x_left, new_x_right, padding=0.0)
+			self.plot.setYRange(view_range[1][0], view_range[1][1], padding=0.0)
+		elif preserve_view and view_range is not None:
 			self.plot.setXRange(view_range[0][0], view_range[0][1], padding=0.0)
 			self.plot.setYRange(view_range[1][0], view_range[1][1], padding=0.0)
 		elif np.isfinite(x_min) and np.isfinite(x_max):
 			self.plot.setXRange(x_min, x_max if x_max > x_min else x_min + 1.0, padding=0.01)
-		self.hover_label.setText("Move the mouse over the plot to inspect the current time.")
-		self.hover_detail_label.setText("")
+		self._set_status_text(self._latest_x_value, self._latest_layer_frames())
 		self._has_rendered_plot = True
+
+	def _refresh_plot_in_place(self) -> bool:
+		if not self._has_rendered_plot or self.right_stack.currentIndex() != 0:
+			return False
+		for list_widget in self._channel_lists.values():
+			list_widget.clear_values()
+		selected_channels = self._selected_channels()
+		if not selected_channels:
+			self.hover_label.setText("No channels selected")
+			self.hover_detail_label.setText("frames: --")
+			return False
+		return self._update_existing_curves(self._sorted_visible_channels(selected_channels), self.plot.getPlotItem().viewRange())
 
 	def _build_pen(self, color: str, style: LayerStyleSpec, highlighted: bool) -> QtGui.QPen:
 		return pg.mkPen(
@@ -506,16 +727,12 @@ class OMFViewer(QtWidgets.QWidget):
 			self.hover_line.hide()
 			for list_widget in self._channel_lists.values():
 				list_widget.clear_values()
-			self.hover_label.setText("Move the mouse over the plot to inspect the current time.")
-			self.hover_detail_label.setText("")
 			return
 		scene_pos = event[0]
 		if not self.plot.sceneBoundingRect().contains(scene_pos):
 			self.hover_line.hide()
 			for list_widget in self._channel_lists.values():
 				list_widget.clear_values()
-			self.hover_label.setText("Move the mouse over the plot to inspect the current time.")
-			self.hover_detail_label.setText("")
 			return
 		mouse_point = self.plot.getPlotItem().vb.mapSceneToView(scene_pos)
 		x_value = float(mouse_point.x())
@@ -534,9 +751,7 @@ class OMFViewer(QtWidgets.QWidget):
 				index -= 1
 			self._channel_lists[channel.layer_name].set_value_text(channel.key, f"{float(channel.values[index]):.6f}")
 			layer_frames.setdefault(channel.layer_name, (index + 1, channel.x_values.size))
-		self.hover_label.setText(f"t = {x_value:.3f}s")
-		detail_lines = [f"{layer_name} {frame_index}/{frame_count}" for layer_name, (frame_index, frame_count) in layer_frames.items()]
-		self.hover_detail_label.setText("\n".join(detail_lines))
+		self._set_status_text(x_value, layer_frames)
 
 
 def show_omf_viewer(

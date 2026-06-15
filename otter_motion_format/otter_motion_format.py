@@ -426,6 +426,51 @@ class OMF:
 		self.validate()
 		return _deep_copy_data(self.data)
 
+	def append_frame(self, frame_data: dict[str, dict[str, Any]]) -> None:
+		for data_name, payload in frame_data.items():
+			section = self.data_section(data_name)
+			self._append_section_frame(section, payload)
+		self.validate()
+
+	def truncate_frames(self, max_frames: int, *, data_names: list[str] | None = None) -> None:
+		if max_frames <= 0:
+			return
+		for data_name in (data_names or self.data_names):
+			section = self.data_section(data_name)
+			self._truncate_section(section, max_frames)
+		self.validate()
+
+	def _append_section_frame(self, section: dict[str, Any], payload: dict[str, Any]) -> None:
+		if "root_pos" in payload:
+			section["root_pos"].append(_deep_copy_data(payload["root_pos"]))
+		if "root_rot" in payload:
+			section["root_rot"].append(_deep_copy_data(payload["root_rot"]))
+		if "time" in payload:
+			section["time"].append(_deep_copy_data(payload["time"]))
+
+		for group_name in ("joint", "link", "imu"):
+			group_payload = payload.get(group_name)
+			if not isinstance(group_payload, dict):
+				continue
+			for field_name, field_value in group_payload.items():
+				if field_name not in section[group_name]:
+					section[group_name][field_name] = []
+				section[group_name][field_name].append(_deep_copy_data(field_value))
+
+		section["length"] = self._section_length(section)
+
+	def _truncate_section(self, section: dict[str, Any], max_frames: int) -> None:
+		for key in ("root_pos", "root_rot", "time"):
+			value = section.get(key, [])
+			if isinstance(value, list) and len(value) > max_frames:
+				section[key] = value[-max_frames:]
+		for group_name in ("joint", "link", "imu"):
+			group = section.get(group_name, {})
+			for field_name, value in group.items():
+				if isinstance(value, list) and len(value) > max_frames:
+					group[field_name] = value[-max_frames:]
+		section["length"] = self._section_length(section)
+
 	def save(self, path: str | Path) -> None:
 		self.validate()
 		path = Path(path)
@@ -443,28 +488,28 @@ class OMF:
 			return
 		raise ValueError(f"Unsupported output format: {suffix}")
 
+	def build_chart_payload(self, rot_format: str | None = None) -> dict[str, list[dict[str, Any]]]:
+		self.validate()
+		return {
+			data_name: self._build_channels(data_name=data_name, rot_format=rot_format)
+			for data_name in self.data_names
+		}
+
+	def resolve_chart_preselected(self, keys: list[str] | None = None, rot_format: str | None = None) -> dict[str, set[str]]:
+		self.validate()
+		return self._resolve_preselected_keys(keys=keys, rot_format=rot_format)
+
 	def show_chart(self, keys: list[str] | None = None, rot_format: str | None = None) -> None:
 		self.validate()
 		try:
-			from .viewer import ChannelSpec, show_omf_viewer
+			from .viewer import build_channel_specs, show_omf_viewer
 		except ImportError as exc:
 			raise ImportError(
 				"Visualization requires optional dependencies. Install with: pip install 'otter-motion-format[viz]'"
 			) from exc
 
-		sections: dict[str, list[ChannelSpec]] = {}
-		for data_name in self.data_names:
-			sections[data_name] = [
-				ChannelSpec(
-					key=channel["key"],
-					label=channel["label"],
-					values=channel["values"],
-					x_values=channel["x_values"],
-					layer_name=data_name,
-				)
-				for channel in self._build_channels(data_name=data_name, rot_format=rot_format)
-			]
-		preselected = self._resolve_preselected_keys(keys=keys, rot_format=rot_format)
+		sections = build_channel_specs(self.build_chart_payload(rot_format=rot_format))
+		preselected = self.resolve_chart_preselected(keys=keys, rot_format=rot_format)
 		show_omf_viewer(
 			title=self.name or "OMF Viewer",
 			sections=sections,
@@ -564,9 +609,7 @@ class OMF:
 				default_keys = {
 					channel["key"]
 					for channel in channels
-					if channel["key"].endswith(".root_pos.x")
-					or channel["key"].endswith(".root_pos.y")
-					or channel["key"].endswith(".root_pos.z")
+					if str(channel["key"]).endswith(".root_rot.euler.pitch")
 				}
 				sections[data_name] = default_keys
 			return sections

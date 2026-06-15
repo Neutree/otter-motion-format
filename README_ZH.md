@@ -154,6 +154,14 @@ otter-motion-format "数据文件路径.msgpack"
 * 支持查看鼠标指针位置当前时刻值
 * 支持修改曲线颜色
 
+## 实时可视化曲线
+
+不光可以离线看数据，也支持实时查看，通过 TCP 发送数据实现实时查看曲线，方便调试。
+* 执行`otter-omf-listen` 在要看曲线的电脑上监听。
+* 在采集端调用`otter_motion_format.OMFStreamClient` 类发送数据，这样在监听端就能实时看到曲线了。
+
+
+
 
 ## LICENSE 开源协议
 

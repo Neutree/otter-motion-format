@@ -256,9 +256,30 @@ class OMFStreamSession:
 		for frame in frames:
 			sections = frame.get("sections", {})
 			if isinstance(sections, dict):
-				self.motion.append_frame(sections)
+				self.motion.append_frame(sections, validate=False)
 		if max_live_frames > 0 and self.live_data_names:
-			self.motion.truncate_frames(max_live_frames, data_names=self.live_data_names)
+			self.motion.truncate_frames(max_live_frames, data_names=self.live_data_names, validate=False)
+
+
+def _merge_channel_payloads(
+	catalog_payload: dict[str, list[dict[str, Any]]],
+	value_payload: dict[str, list[dict[str, Any]]],
+) -> dict[str, list[dict[str, Any]]]:
+	merged: dict[str, list[dict[str, Any]]] = {
+		section_name: [dict(channel) for channel in channels]
+		for section_name, channels in catalog_payload.items()
+	}
+	for section_name, channels in value_payload.items():
+		by_key = {channel["key"]: channel for channel in merged.get(section_name, [])}
+		section_channels = merged.setdefault(section_name, [])
+		for channel in channels:
+			existing = by_key.get(channel["key"])
+			if existing is None:
+				section_channels.append(dict(channel))
+			else:
+				existing["values"] = channel["values"]
+				existing["x_values"] = channel["x_values"]
+	return merged
 
 
 class OMFStreamListener(threading.Thread):
@@ -350,7 +371,7 @@ class OMFStreamListener(threading.Thread):
 def run_stream_listener(
 	host: str = "0.0.0.0",
 	port: int = 8765,
-	refresh_interval_s: float = 0.2,
+	refresh_interval_s: float = 0.02,
 	rot_format: str | None = None,
 	refresh_raw_data: bool = False,
 	max_live_frames: int = 4000,
@@ -369,6 +390,8 @@ def run_stream_listener(
 	listener = OMFStreamListener(host=host, port=port, event_queue=event_queue)
 	sessions: dict[str, OMFStreamSession] = {}
 	viewers: dict[str, OMFViewer] = {}
+	topology_signatures: dict[str, tuple[Any, ...]] = {}
+	live_frame_limits: dict[str, int] = {}
 	print(f"[otter-stream] listening on {host}:{port}")
 
 	def handle_sigint(_signum, _frame) -> None:
@@ -380,34 +403,87 @@ def run_stream_listener(
 	except ValueError:
 		pass
 
+	def _clear_viewer(client_id: str) -> None:
+		viewers.pop(client_id, None)
+		topology_signatures.pop(client_id, None)
+		live_frame_limits.pop(client_id, None)
+
+	def _current_max_live_frames(client_id: str) -> int:
+		viewer = viewers.get(client_id)
+		if viewer is not None:
+			return int(viewer.max_live_frames)
+		return int(live_frame_limits.get(client_id, max_live_frames))
+
+	def _on_max_live_frames_changed(client_id: str, value: int) -> None:
+		live_frame_limits[client_id] = max(0, int(value))
+		session = sessions.get(client_id)
+		if session is None or session.motion is None:
+			return
+		limit = live_frame_limits[client_id]
+		if limit > 0 and session.live_data_names:
+			session.motion.truncate_frames(limit, data_names=session.live_data_names, validate=False)
+		refresh_viewer(client_id)
+
+	def _selected_keys_for_viewer(client_id: str, session: OMFStreamSession) -> set[str]:
+		viewer = viewers.get(client_id)
+		if viewer is not None:
+			checked = viewer.checked_channel_keys()
+			if checked:
+				return checked
+		preselected = session.motion.resolve_chart_preselected(rot_format=rot_format) if session.motion is not None else {}
+		return {key for keys in preselected.values() for key in keys}
+
 	def refresh_viewer(client_id: str) -> None:
 		session = sessions.get(client_id)
 		if session is None or session.motion is None:
 			return
-		sections = build_channel_specs(session.motion.build_chart_payload(rot_format=rot_format))
-		preselected = session.motion.resolve_chart_preselected(rot_format=rot_format)
-		raw_data = session.motion.to_dict() if refresh_raw_data else None
+		selected_keys = _selected_keys_for_viewer(client_id, session)
+		value_payload = session.motion.build_chart_payload(
+			rot_format=rot_format,
+			channel_keys=selected_keys or None,
+			include_values=True,
+			validate=False,
+		)
 		viewer = viewers.get(client_id)
-		if viewer is None:
-			viewer = OMFViewer(
-				title=session.title,
-				sections=sections,
-				preselected=preselected,
-				layer_styles=session.motion._default_layer_styles(),
-				raw_data=raw_data or {},
+		signature = session.motion.chart_topology_signature(rot_format=rot_format)
+		topology_changed = topology_signatures.get(client_id) != signature
+		if viewer is None or topology_changed:
+			catalog_payload = session.motion.build_chart_payload(
+				rot_format=rot_format,
+				include_values=False,
+				validate=False,
 			)
-			viewer.destroyed.connect(lambda *_args, client_id=client_id: _clear_viewer(client_id))
-			viewers[client_id] = viewer
-			viewer.show()
-			viewer.raise_()
-			viewer.activateWindow()
-			print(f"[otter-stream] viewer ready for {client_id}: {session.title}")
-		else:
-			viewer.set_sections(sections=sections, raw_data=raw_data, preselected=preselected)
-			viewer.setWindowTitle(session.title)
+			sections = build_channel_specs(_merge_channel_payloads(catalog_payload, value_payload))
+			preselected = session.motion.resolve_chart_preselected(rot_format=rot_format)
+			raw_data = session.motion.to_dict() if refresh_raw_data else None
+			if viewer is None:
+				viewer = OMFViewer(
+					title=session.title,
+					sections=sections,
+					preselected=preselected,
+					layer_styles=session.motion._default_layer_styles(),
+					raw_data=raw_data or {},
+					max_live_frames=live_frame_limits.get(client_id, max_live_frames),
+				)
+				viewer.destroyed.connect(lambda *_args, client_id=client_id: _clear_viewer(client_id))
+				viewer.maxLiveFramesChanged.connect(
+					lambda value, client_id=client_id: _on_max_live_frames_changed(client_id, value)
+				)
+				viewer.liveSelectionChanged.connect(lambda client_id=client_id: refresh_viewer(client_id))
+				viewers[client_id] = viewer
+				live_frame_limits[client_id] = viewer.max_live_frames
+				viewer.show()
+				viewer.raise_()
+				viewer.activateWindow()
+				print(f"[otter-stream] viewer ready for {client_id}: {session.title}")
+			else:
+				viewer.set_sections(sections=sections, raw_data=raw_data, preselected=None)
+				viewer.setWindowTitle(session.title)
+			topology_signatures[client_id] = signature
+			return
 
-	def _clear_viewer(client_id: str) -> None:
-		viewers.pop(client_id, None)
+		viewer.update_live_channel_values(build_channel_specs(value_payload))
+		viewer.setWindowTitle(session.title)
 
 	def drain_queue() -> None:
 		changed_clients: set[str] = set()
@@ -426,12 +502,16 @@ def run_stream_listener(
 					f"{message.get('motion_name', 'live_motion')}"
 				)
 				session.initialize(message)
+				topology_signatures.pop(client_id, None)
 				changed_clients.add(client_id)
 			elif message_type == "frames":
 				session = sessions.get(client_id)
 				if session is None:
 					continue
-				session.append_frames(list(message.get("frames", [])), max_live_frames=max_live_frames)
+				session.append_frames(
+					list(message.get("frames", [])),
+					max_live_frames=_current_max_live_frames(client_id),
+				)
 				changed_clients.add(client_id)
 			elif message_type == "status":
 				print(f"[otter-stream] {client_id} {message.get('message', '')}")
@@ -467,8 +547,8 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument(
 		"--refresh-interval",
 		type=float,
-		default=0.2,
-		help="GUI refresh interval in seconds",
+		default=0.02,
+		help="GUI refresh interval in seconds (default: 0.02 for ~50 Hz)",
 	)
 	parser.add_argument(
 		"--rot-format",
@@ -485,7 +565,7 @@ def build_parser() -> argparse.ArgumentParser:
 		"--max-live-frames",
 		type=int,
 		default=4000,
-		help="Keep only the most recent live frames per streamed section to preserve UI responsiveness; <=0 disables trimming",
+		help="Initial rolling history window for live sections; 0 keeps all frames. Also configurable in the viewer UI.",
 	)
 	return parser
 

@@ -248,6 +248,9 @@ class ChannelListWidget(QtWidgets.QWidget):
 
 
 class OMFViewer(QtWidgets.QWidget):
+	maxLiveFramesChanged = QtCore.Signal(int)
+	liveSelectionChanged = QtCore.Signal()
+
 	_STYLE_MAP = {
 		"solid": QtCore.Qt.SolidLine,
 		"dash": QtCore.Qt.DashLine,
@@ -262,6 +265,7 @@ class OMFViewer(QtWidgets.QWidget):
 		preselected: dict[str, set[str]] | None = None,
 		layer_styles: dict[str, LayerStyleSpec] | dict[str, dict[str, object]] | None = None,
 		raw_data: dict[str, object] | None = None,
+		max_live_frames: int = 4000,
 		parent: QtWidgets.QWidget | None = None,
 	) -> None:
 		super().__init__(parent)
@@ -283,6 +287,8 @@ class OMFViewer(QtWidgets.QWidget):
 		self._hover_detail_font = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
 		self._follow_latest_enabled = False
 		self._latest_x_value: float | None = None
+		self._max_live_frames = max(0, int(max_live_frames))
+		self._suspend_live_selection_signal = False
 
 		pg.setConfigOptions(antialias=False)
 
@@ -310,6 +316,21 @@ class OMFViewer(QtWidgets.QWidget):
 		self.follow_latest_button.toggled.connect(self._on_follow_latest_toggled)
 		left_toolbar.addWidget(self.follow_latest_button)
 		left_toolbar.addStretch(1)
+
+		history_row = QtWidgets.QHBoxLayout()
+		left_layout.addLayout(history_row)
+		history_row.addWidget(QtWidgets.QLabel("History frames"))
+		self.max_live_frames_spin = QtWidgets.QSpinBox()
+		self.max_live_frames_spin.setRange(0, 1_000_000)
+		self.max_live_frames_spin.setSingleStep(100)
+		self.max_live_frames_spin.setSpecialValueText("Unlimited")
+		self.max_live_frames_spin.setValue(self._max_live_frames)
+		self.max_live_frames_spin.setToolTip(
+			"Optional rolling history window for live streams. 0 keeps all received frames (no sample drop). "
+			"Use a finite value only to cap memory / plot length."
+		)
+		self.max_live_frames_spin.valueChanged.connect(self._on_max_live_frames_changed)
+		history_row.addWidget(self.max_live_frames_spin, 1)
 
 		self.tabs = QtWidgets.QTabWidget()
 		self.tabs.setMinimumWidth(360)
@@ -383,6 +404,44 @@ class OMFViewer(QtWidgets.QWidget):
 	def _on_follow_latest_toggled(self, checked: bool) -> None:
 		self._follow_latest_enabled = bool(checked)
 
+	def _on_max_live_frames_changed(self, value: int) -> None:
+		self._max_live_frames = max(0, int(value))
+		self.maxLiveFramesChanged.emit(self._max_live_frames)
+
+	@property
+	def max_live_frames(self) -> int:
+		return self._max_live_frames
+
+	def checked_channel_keys(self) -> set[str]:
+		keys: set[str] = set()
+		for list_widget in self._channel_lists.values():
+			keys.update(list_widget.checked_keys())
+		return keys
+
+	def _on_channel_selection_changed(self) -> None:
+		if not self._suspend_live_selection_signal:
+			self.liveSelectionChanged.emit()
+		self._refresh_plot()
+
+	def _is_plot_interacting(self) -> bool:
+		buttons = QtWidgets.QApplication.mouseButtons()
+		return bool(buttons & (QtCore.Qt.LeftButton | QtCore.Qt.RightButton | QtCore.Qt.MiddleButton))
+
+	def update_live_channel_values(self, sections: dict[str, list[ChannelSpec]]) -> None:
+		for section_name, section_channels in sections.items():
+			channel_map = self._channel_maps.get(section_name)
+			if channel_map is None:
+				continue
+			for channel in section_channels:
+				existing = channel_map.get(channel.key)
+				if existing is None:
+					channel_map[channel.key] = channel
+				else:
+					existing.values = channel.values
+					existing.x_values = channel.x_values
+		if not self._refresh_plot_in_place():
+			self._refresh_plot()
+
 	def _set_status_text(self, x_value: float | None, layer_frames: dict[str, tuple[int, int]]) -> None:
 		if x_value is not None:
 			self.hover_label.setText(f"t = {x_value:.3f}s")
@@ -446,7 +505,7 @@ class OMFViewer(QtWidgets.QWidget):
 				preselected=selected_state.get(section_name),
 				colors={channel.key: self._channel_colors[channel.key] for channel in section_channels},
 			)
-			list_widget.selectionChanged.connect(self._refresh_plot)
+			list_widget.selectionChanged.connect(self._on_channel_selection_changed)
 			list_widget.currentKeyChanged.connect(lambda key, section_name=section_name: self._on_current_key_changed(section_name, key))
 			list_widget.channelColorChanged.connect(self._on_channel_color_changed)
 			desired_active_key = active_state.get(section_name)
@@ -476,12 +535,18 @@ class OMFViewer(QtWidgets.QWidget):
 		}
 		topology_changed = current_keys != new_keys or set(current_keys.keys()) != set(new_keys.keys())
 		if topology_changed:
-			self._set_section_tabs(sections, preselected=preselected, preserve_state=True)
+			self._suspend_live_selection_signal = True
+			try:
+				self._set_section_tabs(sections, preselected=preselected, preserve_state=True)
+			finally:
+				self._suspend_live_selection_signal = False
 		else:
-			self._channel_maps = {
-				section_name: {channel.key: channel for channel in section_channels}
-				for section_name, section_channels in sections.items()
-			}
+			for section_name, section_channels in sections.items():
+				channel_map = self._channel_maps.setdefault(section_name, {})
+				for channel in section_channels:
+					existing = channel_map.get(channel.key)
+					if existing is None or existing.values.size == 0 or channel.values.size > 0:
+						channel_map[channel.key] = channel
 		if raw_data is not None:
 			self._raw_data = raw_data
 			self._populate_raw_tree()
@@ -607,6 +672,9 @@ class OMFViewer(QtWidgets.QWidget):
 
 		self._visible_channels = sorted_channels
 		self._latest_x_value = x_max if np.isfinite(x_max) else None
+		if self._is_plot_interacting():
+			self._set_status_text(self._latest_x_value, self._latest_layer_frames())
+			return True
 		if (
 			self._follow_latest_enabled
 			and view_range is not None
@@ -675,23 +743,24 @@ class OMFViewer(QtWidgets.QWidget):
 				x_min = min(x_min, float(channel.x_values[0]))
 				x_max = max(x_max, float(channel.x_values[-1]))
 		self._latest_x_value = x_max if np.isfinite(x_max) else None
-		if (
-			self._follow_latest_enabled
-			and preserve_view
-			and view_range is not None
-			and follow_anchor_ratio is not None
-			and follow_anchor_width is not None
-			and np.isfinite(x_max)
-		):
-			new_x_left = x_max - follow_anchor_ratio * follow_anchor_width
-			new_x_right = new_x_left + follow_anchor_width
-			self.plot.setXRange(new_x_left, new_x_right, padding=0.0)
-			self.plot.setYRange(view_range[1][0], view_range[1][1], padding=0.0)
-		elif preserve_view and view_range is not None:
-			self.plot.setXRange(view_range[0][0], view_range[0][1], padding=0.0)
-			self.plot.setYRange(view_range[1][0], view_range[1][1], padding=0.0)
-		elif np.isfinite(x_min) and np.isfinite(x_max):
-			self.plot.setXRange(x_min, x_max if x_max > x_min else x_min + 1.0, padding=0.01)
+		if not self._is_plot_interacting():
+			if (
+				self._follow_latest_enabled
+				and preserve_view
+				and view_range is not None
+				and follow_anchor_ratio is not None
+				and follow_anchor_width is not None
+				and np.isfinite(x_max)
+			):
+				new_x_left = x_max - follow_anchor_ratio * follow_anchor_width
+				new_x_right = new_x_left + follow_anchor_width
+				self.plot.setXRange(new_x_left, new_x_right, padding=0.0)
+				self.plot.setYRange(view_range[1][0], view_range[1][1], padding=0.0)
+			elif preserve_view and view_range is not None:
+				self.plot.setXRange(view_range[0][0], view_range[0][1], padding=0.0)
+				self.plot.setYRange(view_range[1][0], view_range[1][1], padding=0.0)
+			elif np.isfinite(x_min) and np.isfinite(x_max):
+				self.plot.setXRange(x_min, x_max if x_max > x_min else x_min + 1.0, padding=0.01)
 		self._set_status_text(self._latest_x_value, self._latest_layer_frames())
 		self._has_rendered_plot = True
 

@@ -157,8 +157,10 @@ otter-motion-format "数据文件路径.msgpack"
 ## 实时可视化曲线
 
 不光可以离线看数据，也支持实时查看，通过 TCP 发送数据实现实时查看曲线，方便调试。
-* 执行`otter-omf-listen` 在要看曲线的电脑上监听。
+* 执行`otter-omf-listen` 在要看曲线的电脑上监听（默认约 50 Hz 刷新）。
 * 在采集端调用`otter_motion_format.OMFStreamClient` 类发送数据，这样在监听端就能实时看到曲线了。
+* 听端只重算当前勾选通道，不丢采样；左侧 **History frames** 可设滚动窗口（`0` = Unlimited 保留全部历史）。
+* 常用参数：`--refresh-interval 0.02`、`--max-live-frames 4000`（也可界面改）。
 
 
 

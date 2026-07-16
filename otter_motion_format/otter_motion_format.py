@@ -146,6 +146,70 @@ def _quaternion_xyzw_to_rotvec(quaternion_xyzw: np.ndarray) -> np.ndarray:
 	axis = xyz / sin_half
 	return axis * angle
 
+
+def _stabilize_quaternion_xyzw_batch(quaternions: np.ndarray) -> np.ndarray:
+	stable = np.asarray(quaternions, dtype=np.float64).copy()
+	if stable.shape[0] <= 1:
+		return stable
+	dots = np.sum(stable[1:] * stable[:-1], axis=1)
+	signs = np.cumprod(np.where(dots < 0.0, -1.0, 1.0))
+	stable[1:] *= signs[:, None]
+	return stable
+
+
+def _quaternion_xyzw_to_euler_xyz_batch(quaternions: np.ndarray) -> np.ndarray:
+	quaternions = np.asarray(quaternions, dtype=np.float64)
+	if quaternions.size == 0:
+		return np.zeros((0, 3), dtype=np.float64)
+	x = quaternions[:, 0]
+	y = quaternions[:, 1]
+	z = quaternions[:, 2]
+	w = quaternions[:, 3]
+	sinr_cosp = 2.0 * (w * x + y * z)
+	cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+	roll = np.arctan2(sinr_cosp, cosr_cosp)
+	sinp = 2.0 * (w * y - z * x)
+	pitch = np.where(np.abs(sinp) >= 1.0, np.sign(sinp) * (np.pi / 2.0), np.arcsin(np.clip(sinp, -1.0, 1.0)))
+	siny_cosp = 2.0 * (w * z + x * y)
+	cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+	yaw = np.arctan2(siny_cosp, cosy_cosp)
+	euler = np.column_stack((roll, pitch, yaw))
+	if euler.shape[0] > 1:
+		euler[:, 2] = np.unwrap(euler[:, 2])
+	return euler
+
+
+def _quaternion_xyzw_to_rotvec_batch(quaternions: np.ndarray) -> np.ndarray:
+	quaternions = np.asarray(quaternions, dtype=np.float64)
+	if quaternions.size == 0:
+		return np.zeros((0, 3), dtype=np.float64)
+	norms = np.linalg.norm(quaternions, axis=1, keepdims=True)
+	safe = norms > 1e-12
+	normalized = np.divide(quaternions, norms, out=np.zeros_like(quaternions), where=safe)
+	xyz = normalized[:, :3]
+	w = np.clip(normalized[:, 3], -1.0, 1.0)
+	angle = 2.0 * np.arccos(w)
+	sin_half = np.sqrt(np.maximum(0.0, 1.0 - w * w))
+	axis = np.divide(xyz, sin_half[:, None], out=np.zeros_like(xyz), where=sin_half[:, None] > 1e-12)
+	rotvec = axis * angle[:, None]
+	rotvec[~safe[:, 0]] = 0.0
+	return rotvec
+
+
+def _copy_frame_value(value: Any) -> Any:
+	if isinstance(value, np.ndarray):
+		return value.tolist()
+	if isinstance(value, list):
+		if not value:
+			return []
+		first = value[0]
+		if isinstance(first, list):
+			return [list(item) if isinstance(item, list) else item for item in value]
+		if isinstance(first, np.ndarray):
+			return [item.tolist() if isinstance(item, np.ndarray) else item for item in value]
+		return list(value)
+	return _deep_copy_data(value)
+
 def msgpack_encode_datetime(obj):
     if isinstance(obj, datetime):
         return obj.strftime("%Y%m%dT%H:%M:%S.%f")
@@ -236,6 +300,8 @@ class OMF:
 				"acc": [],
 				"tau": [],
 				"temp": [],
+				"voltage": [],
+				"current": [],
 			},
 			"link": {
 				"pos": [],
@@ -393,7 +459,7 @@ class OMF:
 		if time_values.shape[0] not in (0, length):
 			raise ValueError(f"{data_name}.time length mismatch: expected 0 or {length}, got {time_values.shape[0]}")
 		for group_name, key_specs in {
-			"joint": ("pos", "vel", "acc", "tau", "temp"),
+			"joint": ("pos", "vel", "acc", "tau", "temp", "voltage", "current"),
 			"link": ("pos", "rot", "lin_vel", "ang_vel"),
 			"imu": ("pos", "rot", "gyro", "acc", "lin_vel"),
 		}.items():
@@ -426,27 +492,52 @@ class OMF:
 		self.validate()
 		return _deep_copy_data(self.data)
 
-	def append_frame(self, frame_data: dict[str, dict[str, Any]]) -> None:
+	def append_frame(self, frame_data: dict[str, dict[str, Any]], *, validate: bool = True) -> None:
 		for data_name, payload in frame_data.items():
 			section = self.data_section(data_name)
 			self._append_section_frame(section, payload)
-		self.validate()
+		if validate:
+			self.validate()
 
-	def truncate_frames(self, max_frames: int, *, data_names: list[str] | None = None) -> None:
+	def truncate_frames(self, max_frames: int, *, data_names: list[str] | None = None, validate: bool = True) -> None:
 		if max_frames <= 0:
 			return
 		for data_name in (data_names or self.data_names):
 			section = self.data_section(data_name)
 			self._truncate_section(section, max_frames)
-		self.validate()
+		if validate:
+			self.validate()
+
+	def chart_topology_signature(self, rot_format: str | None = None) -> tuple[Any, ...]:
+		signature: list[Any] = [rot_format]
+		for data_name in self.data_names:
+			section = self.data_section(data_name)
+			signature.append(
+				(
+					data_name,
+					int(section.get("fps", 0) or 0),
+					bool(section.get("root_pos")),
+					bool(section.get("root_rot")),
+					tuple(field_name for field_name, value in section.get("joint", {}).items() if value),
+					tuple(field_name for field_name, value in section.get("link", {}).items() if value),
+					tuple(field_name for field_name, value in section.get("imu", {}).items() if value),
+					bool(section.get("time")),
+					tuple(self.basic.get("joint_names", [])),
+					tuple(int(dim) for dim in self.basic.get("joint_dims", [])),
+					tuple(self.basic.get("link_names", [])),
+					tuple(self.basic.get("imu_names", [])),
+					tuple(self.basic.get("time_names", [])),
+				)
+			)
+		return tuple(signature)
 
 	def _append_section_frame(self, section: dict[str, Any], payload: dict[str, Any]) -> None:
 		if "root_pos" in payload:
-			section["root_pos"].append(_deep_copy_data(payload["root_pos"]))
+			section["root_pos"].append(_copy_frame_value(payload["root_pos"]))
 		if "root_rot" in payload:
-			section["root_rot"].append(_deep_copy_data(payload["root_rot"]))
+			section["root_rot"].append(_copy_frame_value(payload["root_rot"]))
 		if "time" in payload:
-			section["time"].append(_deep_copy_data(payload["time"]))
+			section["time"].append(_copy_frame_value(payload["time"]))
 
 		for group_name in ("joint", "link", "imu"):
 			group_payload = payload.get(group_name)
@@ -455,9 +546,20 @@ class OMF:
 			for field_name, field_value in group_payload.items():
 				if field_name not in section[group_name]:
 					section[group_name][field_name] = []
-				section[group_name][field_name].append(_deep_copy_data(field_value))
+				section[group_name][field_name].append(_copy_frame_value(field_value))
 
-		section["length"] = self._section_length(section)
+		section["length"] = max(
+			int(section.get("length", 0) or 0) + 1,
+			len(section.get("root_pos", []) or []),
+			len(section.get("root_rot", []) or []),
+			len(section.get("time", []) or []),
+			*(
+				len(value)
+				for group_name in ("joint", "link", "imu")
+				for value in section.get(group_name, {}).values()
+				if isinstance(value, list)
+			),
+		)
 
 	def _truncate_section(self, section: dict[str, Any], max_frames: int) -> None:
 		for key in ("root_pos", "root_rot", "time"):
@@ -488,15 +590,27 @@ class OMF:
 			return
 		raise ValueError(f"Unsupported output format: {suffix}")
 
-	def build_chart_payload(self, rot_format: str | None = None) -> dict[str, list[dict[str, Any]]]:
-		self.validate()
+	def build_chart_payload(
+		self,
+		rot_format: str | None = None,
+		*,
+		channel_keys: set[str] | None = None,
+		include_values: bool = True,
+		validate: bool = True,
+	) -> dict[str, list[dict[str, Any]]]:
+		if validate:
+			self.validate()
 		return {
-			data_name: self._build_channels(data_name=data_name, rot_format=rot_format)
+			data_name: self._build_channels(
+				data_name=data_name,
+				rot_format=rot_format,
+				include_keys=channel_keys,
+				include_values=include_values,
+			)
 			for data_name in self.data_names
 		}
 
 	def resolve_chart_preselected(self, keys: list[str] | None = None, rot_format: str | None = None) -> dict[str, set[str]]:
-		self.validate()
 		return self._resolve_preselected_keys(keys=keys, rot_format=rot_format)
 
 	def show_chart(self, keys: list[str] | None = None, rot_format: str | None = None) -> None:
@@ -550,7 +664,7 @@ class OMF:
 			root_rot = _as_float_array(section.get("root_rot", []), width=4)
 			section["root_rot"] = _resample_quaternion_array(root_rot, source_times, target_times).tolist() if root_rot.shape[0] > 0 else []
 
-			for field_name in ("pos", "vel", "acc", "tau", "temp"):
+			for field_name in ("pos", "vel", "acc", "tau", "temp", "voltage", "current"):
 				joint_values = _as_float_array(section.get("joint", {}).get(field_name, []), width=joint_total_dim) if joint_total_dim > 0 else np.zeros((0, 0), dtype=np.float64)
 				section["joint"][field_name] = _resample_linear_array(joint_values, source_times, target_times).tolist() if joint_values.shape[0] > 0 else []
 
@@ -601,7 +715,7 @@ class OMF:
 	def _resolve_preselected_keys(self, keys: list[str] | None, rot_format: str | None) -> dict[str, set[str]]:
 		sections = {data_name: set() for data_name in self.data_names}
 		channels_by_section = {
-			data_name: self._build_channels(data_name=data_name, rot_format=rot_format)
+			data_name: self._build_channels(data_name=data_name, rot_format=rot_format, include_values=False)
 			for data_name in self.data_names
 		}
 		if not keys:
@@ -624,10 +738,24 @@ class OMF:
 					sections[data_name].add(channel["key"])
 		return sections
 
-	def _build_channels(self, data_name: str, rot_format: str | None = None) -> list[dict[str, Any]]:
+	def _build_channels(
+		self,
+		data_name: str,
+		rot_format: str | None = None,
+		*,
+		include_keys: set[str] | None = None,
+		include_values: bool = True,
+	) -> list[dict[str, Any]]:
 		section = self.data_section(data_name)
-		self._normalize_section(section)
-		length = int(section.get("length", 0))
+		length = int(section.get("length", 0) or 0)
+		if length <= 0 and not any(
+			bool(section.get(key))
+			for key in ("root_pos", "root_rot", "time")
+		) and not any(bool(value) for group_name in ("joint", "link", "imu") for value in section.get(group_name, {}).values()):
+			# Prefer length, but catalog can also appear from non-empty arrays before length is synced.
+			computed = self._section_length(section)
+			length = computed
+			section["length"] = computed
 		if length == 0:
 			return []
 
@@ -638,68 +766,102 @@ class OMF:
 		imu_names = list(self.basic.get("imu_names", []))
 		time_names = list(self.basic.get("time_names", []))
 		fps = int(section.get("fps", 0) or 0)
-		x_values = np.arange(length, dtype=np.float64) / float(fps) if fps > 0 else np.arange(length, dtype=np.float64)
+		empty_x = np.zeros(0, dtype=np.float64)
+		empty_y = np.zeros(0, dtype=np.float64)
+		x_values = (
+			(np.arange(length, dtype=np.float64) / float(fps) if fps > 0 else np.arange(length, dtype=np.float64))
+			if include_values
+			else empty_x
+		)
 
-		root_pos = _as_float_array(section.get("root_pos", []), width=3)
-		if root_pos.shape[0] > 0:
+		def want(key: str) -> bool:
+			return include_keys is None or key in include_keys
+
+		def add_channel(key: str, label: str, values: np.ndarray | None = None) -> None:
+			if not want(key):
+				return
+			channels.append(
+				{
+					"key": key,
+					"label": label,
+					"values": empty_y if (not include_values or values is None) else values,
+					"x_values": x_values if include_values else empty_x,
+				}
+			)
+
+		root_pos_present = bool(section.get("root_pos"))
+		if root_pos_present:
+			root_pos = _as_float_array(section.get("root_pos", []), width=3) if include_values else None
 			for axis_index, axis_name in enumerate(("x", "y", "z")):
-				channels.append({
-					"key": f"{data_name}.root_pos.{axis_name}",
-					"label": f"{data_name}.root_pos.{axis_name}",
-					"values": root_pos[:, axis_index],
-					"x_values": x_values,
-				})
+				add_channel(
+					f"{data_name}.root_pos.{axis_name}",
+					f"{data_name}.root_pos.{axis_name}",
+					None if root_pos is None else root_pos[:, axis_index],
+				)
 
-		root_rot = _as_float_array(section.get("root_rot", []), width=4)
-		if root_rot.shape[0] > 0:
+		root_rot_present = bool(section.get("root_rot"))
+		if root_rot_present:
+			need_rotvec = rot_format in {None, "both", "rotvec"} and (
+				include_keys is None or any(key.startswith(f"{data_name}.root_rot.rotvec.") for key in include_keys)
+			)
+			need_euler = rot_format in {None, "both", "euler"} and (
+				include_keys is None or any(key.startswith(f"{data_name}.root_rot.euler.") for key in include_keys)
+			)
+			root_rot = None
+			if include_values and (need_rotvec or need_euler):
+				root_rot = _as_float_array(section.get("root_rot", []), width=4)
 			if rot_format in {None, "both", "rotvec"}:
-				stable_quat = root_rot.copy()
-				for index in range(1, stable_quat.shape[0]):
-					if float(np.dot(stable_quat[index - 1], stable_quat[index])) < 0.0:
-						stable_quat[index] = -stable_quat[index]
-				rotvec = np.asarray([_quaternion_xyzw_to_rotvec(quat) for quat in stable_quat], dtype=np.float64)
+				rotvec = None
+				if include_values and need_rotvec and root_rot is not None and root_rot.shape[0] > 0:
+					rotvec = _quaternion_xyzw_to_rotvec_batch(_stabilize_quaternion_xyzw_batch(root_rot))
 				for axis_index, axis_name in enumerate(("x", "y", "z")):
-					channels.append({
-						"key": f"{data_name}.root_rot.rotvec.{axis_name}",
-						"label": f"{data_name}.root_rot.rotvec.{axis_name}",
-						"values": rotvec[:, axis_index],
-						"x_values": x_values,
-					})
+					add_channel(
+						f"{data_name}.root_rot.rotvec.{axis_name}",
+						f"{data_name}.root_rot.rotvec.{axis_name}",
+						None if rotvec is None else rotvec[:, axis_index],
+					)
 			if rot_format in {None, "both", "euler"}:
-				euler = np.asarray([_quaternion_xyzw_to_euler_xyz(quat) for quat in root_rot], dtype=np.float64)
-				euler[:, 2] = np.unwrap(euler[:, 2]) if euler.shape[0] > 1 else euler[:, 2]
+				euler = None
+				if include_values and need_euler and root_rot is not None and root_rot.shape[0] > 0:
+					euler = _quaternion_xyzw_to_euler_xyz_batch(root_rot)
 				for axis_index, axis_name in enumerate(("roll", "pitch", "yaw")):
-					channels.append({
-						"key": f"{data_name}.root_rot.euler.{axis_name}",
-						"label": f"{data_name}.root_rot.euler.{axis_name}",
-						"values": euler[:, axis_index],
-						"x_values": x_values,
-					})
+					add_channel(
+						f"{data_name}.root_rot.euler.{axis_name}",
+						f"{data_name}.root_rot.euler.{axis_name}",
+						None if euler is None else euler[:, axis_index],
+					)
 
 		joint_group = section.get("joint", {})
 		joint_total_dim = int(sum(joint_dims))
-		for field_name in ("pos", "vel", "acc", "tau", "temp"):
-			values = _as_float_array(joint_group.get(field_name, []), width=joint_total_dim) if joint_total_dim > 0 else np.zeros((0, 0), dtype=np.float64)
-			if values.shape[0] == 0:
+		for field_name in ("pos", "vel", "acc", "tau", "temp", "voltage", "current"):
+			if not joint_group.get(field_name):
+				continue
+			field_prefix = f"{data_name}.joint.{field_name}."
+			need_field = include_keys is None or any(key.startswith(field_prefix) for key in include_keys)
+			values = None
+			if include_values and need_field and joint_total_dim > 0:
+				values = _as_float_array(joint_group.get(field_name, []), width=joint_total_dim)
+				if values.shape[0] == 0:
+					continue
+			elif include_values and not need_field:
 				continue
 			start = 0
 			for joint_name, joint_dim in zip(joint_names, joint_dims):
-				joint_slice = values[:, start : start + joint_dim]
 				if joint_dim == 1:
-					channels.append({
-						"key": f"{data_name}.joint.{field_name}.{joint_name}",
-						"label": f"{data_name}.joint.{field_name}.{joint_name}",
-						"values": joint_slice[:, 0],
-						"x_values": x_values,
-					})
+					key = f"{data_name}.joint.{field_name}.{joint_name}"
+					add_channel(
+						key,
+						key,
+						None if values is None else values[:, start],
+					)
 				else:
 					for axis_index in range(joint_dim):
-						channels.append({
-							"key": f"{data_name}.joint.{field_name}.{joint_name}[{axis_index}]",
-							"label": f"{data_name}.joint.{field_name}.{joint_name}[{axis_index}]",
-							"values": joint_slice[:, axis_index],
-							"x_values": x_values,
-						})
+						key = f"{data_name}.joint.{field_name}.{joint_name}[{axis_index}]"
+						add_channel(
+							key,
+							key,
+							None if values is None else values[:, start + axis_index],
+						)
 				start += joint_dim
 
 		link_group = section.get("link", {})
@@ -710,18 +872,26 @@ class OMF:
 			"ang_vel": (3, ("x", "y", "z")),
 		}
 		for field_name, (width, axes) in link_specs.items():
-			values = np.asarray(link_group.get(field_name, []), dtype=np.float64)
-			if values.size == 0:
+			if not link_group.get(field_name) or not link_names:
 				continue
-			values = values.reshape((values.shape[0], len(link_names), width))
+			field_prefix = f"{data_name}.link.{field_name}."
+			need_field = include_keys is None or any(key.startswith(field_prefix) for key in include_keys)
+			values = None
+			if include_values and need_field:
+				raw = np.asarray(link_group.get(field_name, []), dtype=np.float64)
+				if raw.size == 0:
+					continue
+				values = raw.reshape((raw.shape[0], len(link_names), width))
+			elif include_values and not need_field:
+				continue
 			for link_index, link_name in enumerate(link_names):
 				for axis_index, axis_name in enumerate(axes):
-					channels.append({
-						"key": f"{data_name}.link.{field_name}.{link_name}.{axis_name}",
-						"label": f"{data_name}.link.{field_name}.{link_name}.{axis_name}",
-						"values": values[:, link_index, axis_index],
-						"x_values": x_values,
-					})
+					key = f"{data_name}.link.{field_name}.{link_name}.{axis_name}"
+					add_channel(
+						key,
+						key,
+						None if values is None else values[:, link_index, axis_index],
+					)
 
 		imu_group = section.get("imu", {})
 		imu_specs = {
@@ -732,32 +902,55 @@ class OMF:
 			"lin_vel": (3, ("x", "y", "z")),
 		}
 		for field_name, (width, axes) in imu_specs.items():
-			values = np.asarray(imu_group.get(field_name, []), dtype=np.float64)
-			if values.size == 0:
+			if not imu_group.get(field_name) or not imu_names:
 				continue
-			values = values.reshape((values.shape[0], len(imu_names), width))
+			field_prefix = f"{data_name}.imu.{field_name}."
+			need_field = include_keys is None or any(key.startswith(field_prefix) for key in include_keys)
+			values = None
+			if include_values and need_field:
+				raw = np.asarray(imu_group.get(field_name, []), dtype=np.float64)
+				if raw.size == 0:
+					continue
+				values = raw.reshape((raw.shape[0], len(imu_names), width))
+			elif include_values and not need_field:
+				continue
 			for imu_index, imu_name in enumerate(imu_names):
 				for axis_index, axis_name in enumerate(axes):
-					channels.append({
-						"key": f"{data_name}.imu.{field_name}.{imu_name}.{axis_name}",
-						"label": f"{data_name}.imu.{field_name}.{imu_name}.{axis_name}",
-						"values": values[:, imu_index, axis_index],
-						"x_values": x_values,
-					})
+					key = f"{data_name}.imu.{field_name}.{imu_name}.{axis_name}"
+					add_channel(
+						key,
+						key,
+						None if values is None else values[:, imu_index, axis_index],
+					)
 
-		time_values = _normalize_time_array(
-			section.get("time", []),
-			time_name_count=len(time_names),
-		)
-		if time_values.size > 0:
-			inferred_names = time_names if time_values.shape[1] == len(time_names) else [f"time_{index}" for index in range(time_values.shape[1])]
+		if section.get("time"):
+			time_values = None
+			if include_values and (include_keys is None or any(key.startswith(f"{data_name}.time.") for key in include_keys)):
+				time_values = _normalize_time_array(
+					section.get("time", []),
+					time_name_count=len(time_names),
+				)
+			inferred_names = time_names
+			if time_values is not None and time_values.size > 0:
+				inferred_names = (
+					time_names
+					if time_values.shape[1] == len(time_names)
+					else [f"time_{index}" for index in range(time_values.shape[1])]
+				)
+			elif not inferred_names:
+				# Catalog path: infer column count without full validate/normalize.
+				raw_time = np.asarray(section.get("time", []), dtype=np.float64)
+				if raw_time.ndim == 2 and raw_time.shape[1] > 0:
+					inferred_names = [f"time_{index}" for index in range(raw_time.shape[1])]
+				else:
+					inferred_names = time_names or ["time_0"]
 			for time_index, time_name in enumerate(inferred_names):
-				channels.append({
-					"key": f"{data_name}.time.{time_name}",
-					"label": f"{data_name}.time.{time_name}",
-					"values": time_values[:, time_index],
-					"x_values": x_values,
-				})
+				key = f"{data_name}.time.{time_name}"
+				add_channel(
+					key,
+					key,
+					None if time_values is None or time_values.size == 0 else time_values[:, time_index],
+				)
 
 		return channels
 

@@ -36,7 +36,7 @@ format: omf   # Format identifier, used to verify that this is an OMF file
 basic:        # Basic and shared information, such as data name and robot information
 target:       # Desired motion data
 actual:       # Actual recorded motion data, used for logs
-````
+```
 
 `basic`:
 
@@ -157,6 +157,15 @@ The curve viewer currently supports:
 * Left mouse button to pan, right mouse button to zoom quickly, mouse wheel to zoom
 * Viewing the value at the current cursor position
 * Customizing curve colors
+
+## Real-time Curve Visualization
+
+In addition to offline viewing, real-time plotting is supported via TCP streaming, which is useful for debugging.
+
+* Run `otter-omf-listen` on the machine where you want to view the curves (default refresh rate is about 50 Hz).
+* On the data-collection side, use the `otter_motion_format.OMFStreamClient` class to send data; the listener will then show the curves in real time.
+* The listener only recomputes currently selected channels and does not drop samples; use **History frames** on the left to set a rolling window (`0` = Unlimited, keep all history).
+* Common options: `--refresh-interval 0.02`, `--max-live-frames 4000` (also adjustable in the UI).
 
 
 ## LICENSE

@@ -70,6 +70,9 @@ target/model_target/actual: # 和 basic.data_names 相同，推荐优先使用 t
         acc: [] # 类 dof_pos， 关节加速度
         tau: [] # 类 dof_pos， 关节力矩
         temp: [] # 类 dof_pos， 关节温度
+        voltage: []
+        current: []
+        # ... 更多自定义键值
     link:
         pos: []     # shape: (length, len(link_names), 3(xyz)) 世界坐标系下的位移
         rot: []     # shape: (length, len(link_names), 4(xyzw)) 世界坐标系下的旋转

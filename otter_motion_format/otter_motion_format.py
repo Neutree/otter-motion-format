@@ -226,6 +226,22 @@ class OMF:
 	FORMAT = "omf"
 	DEFAULT_DATA_NAMES = ["target", "actual"]
 	_RESERVED_TOP_LEVEL_KEYS = {"version", "format", "basic"}
+	# Recommended starter fields; users may add any extra keys under joint/link/imu.
+	DEFAULT_JOINT_FIELDS = ("pos", "vel", "acc", "tau", "temp", "voltage", "current")
+	DEFAULT_LINK_FIELD_SPECS: dict[str, tuple[int, tuple[str, ...]]] = {
+		"pos": (3, ("x", "y", "z")),
+		"rot": (4, ("x", "y", "z", "w")),
+		"lin_vel": (3, ("x", "y", "z")),
+		"ang_vel": (3, ("x", "y", "z")),
+	}
+	DEFAULT_IMU_FIELD_SPECS: dict[str, tuple[int, tuple[str, ...]]] = {
+		"pos": (3, ("x", "y", "z")),
+		"rot": (4, ("x", "y", "z", "w")),
+		"gyro": (3, ("x", "y", "z")),
+		"acc": (3, ("x", "y", "z")),
+		"lin_vel": (3, ("x", "y", "z")),
+	}
+	_QUATERNION_FIELD_NAMES = frozenset({"rot"})
 
 	def __init__(
 		self,
@@ -287,37 +303,54 @@ class OMF:
 		elif not isinstance(date_value, datetime):
 			basic["date"] = None
 
-	@staticmethod
-	def _empty_section() -> dict[str, Any]:
+	@classmethod
+	def _empty_section(cls) -> dict[str, Any]:
 		return {
 			"fps": 0,
 			"length": 0,
 			"root_pos": [],
 			"root_rot": [],
-			"joint": {
-				"pos": [],
-				"vel": [],
-				"acc": [],
-				"tau": [],
-				"temp": [],
-				"voltage": [],
-				"current": [],
-			},
-			"link": {
-				"pos": [],
-				"rot": [],
-				"lin_vel": [],
-				"ang_vel": [],
-			},
-			"imu": {
-				"pos": [],
-				"rot": [],
-				"gyro": [],
-				"acc": [],
-				"lin_vel": [],
-			},
+			"joint": {field_name: [] for field_name in cls.DEFAULT_JOINT_FIELDS},
+			"link": {field_name: [] for field_name in cls.DEFAULT_LINK_FIELD_SPECS},
+			"imu": {field_name: [] for field_name in cls.DEFAULT_IMU_FIELD_SPECS},
 			"time": [],
 		}
+
+	@staticmethod
+	def _axis_names_for_width(width: int) -> tuple[str, ...]:
+		if width == 3:
+			return ("x", "y", "z")
+		if width == 4:
+			return ("x", "y", "z", "w")
+		return tuple(str(index) for index in range(width))
+
+	@classmethod
+	def _resolve_entity_field_spec(
+		cls,
+		field_name: str,
+		values: Any,
+		*,
+		length: int,
+		entity_count: int,
+		known_specs: dict[str, tuple[int, tuple[str, ...]]],
+	) -> tuple[int, tuple[str, ...]] | None:
+		if field_name in known_specs:
+			return known_specs[field_name]
+		if entity_count <= 0 or length <= 0:
+			return None
+		raw = np.asarray(values, dtype=np.float64)
+		if raw.size == 0:
+			return None
+		if raw.ndim == 3 and raw.shape[0] == length and raw.shape[1] == entity_count:
+			width = int(raw.shape[2])
+			return width, cls._axis_names_for_width(width)
+		if raw.ndim == 2 and raw.shape[0] == length and raw.shape[1] % entity_count == 0:
+			width = int(raw.shape[1] // entity_count)
+			return width, cls._axis_names_for_width(width)
+		if raw.ndim == 1 and length == 1 and raw.shape[0] % entity_count == 0:
+			width = int(raw.shape[0] // entity_count)
+			return width, cls._axis_names_for_width(width)
+		return None
 
 	@classmethod
 	def _normalize_data_names(cls, data_names: list[str]) -> list[str]:
@@ -361,7 +394,15 @@ class OMF:
 			section = self.data.setdefault(data_name, self._empty_section())
 			default = self._empty_section()
 			for key, value in default.items():
-				section.setdefault(key, _deep_copy_data(value))
+				if key in ("joint", "link", "imu"):
+					group = section.setdefault(key, {})
+					if not isinstance(group, dict):
+						section[key] = _deep_copy_data(value)
+						continue
+					for field_name, field_default in value.items():
+						group.setdefault(field_name, _deep_copy_data(field_default))
+				else:
+					section.setdefault(key, _deep_copy_data(value))
 
 	@property
 	def basic(self) -> dict[str, Any]:
@@ -458,14 +499,13 @@ class OMF:
 		time_values = _normalize_time_array(section.get("time", []), time_name_count=len(self.basic.get("time_names", [])))
 		if time_values.shape[0] not in (0, length):
 			raise ValueError(f"{data_name}.time length mismatch: expected 0 or {length}, got {time_values.shape[0]}")
-		for group_name, key_specs in {
-			"joint": ("pos", "vel", "acc", "tau", "temp", "voltage", "current"),
-			"link": ("pos", "rot", "lin_vel", "ang_vel"),
-			"imu": ("pos", "rot", "gyro", "acc", "lin_vel"),
-		}.items():
+		for group_name in ("joint", "link", "imu"):
 			group = section.get(group_name, {})
-			for key in key_specs:
-				value = group.get(key, [])
+			if not isinstance(group, dict):
+				raise ValueError(f"{data_name}.{group_name} must be a dict of named fields")
+			for key, value in group.items():
+				if not isinstance(value, (list, np.ndarray)):
+					raise ValueError(f"{data_name}.{group_name}.{key} must be a list or array")
 				if len(value) not in (0, length):
 					raise ValueError(
 						f"{data_name}.{group_name}.{key} length mismatch: expected 0 or {length}, got {len(value)}"
@@ -664,27 +704,75 @@ class OMF:
 			root_rot = _as_float_array(section.get("root_rot", []), width=4)
 			section["root_rot"] = _resample_quaternion_array(root_rot, source_times, target_times).tolist() if root_rot.shape[0] > 0 else []
 
-			for field_name in ("pos", "vel", "acc", "tau", "temp", "voltage", "current"):
-				joint_values = _as_float_array(section.get("joint", {}).get(field_name, []), width=joint_total_dim) if joint_total_dim > 0 else np.zeros((0, 0), dtype=np.float64)
-				section["joint"][field_name] = _resample_linear_array(joint_values, source_times, target_times).tolist() if joint_values.shape[0] > 0 else []
+			joint_group = section.setdefault("joint", {})
+			for field_name, field_values in list(joint_group.items()):
+				if not field_values:
+					joint_group[field_name] = []
+					continue
+				joint_values = (
+					_as_float_array(field_values, width=joint_total_dim)
+					if joint_total_dim > 0
+					else np.zeros((0, 0), dtype=np.float64)
+				)
+				joint_group[field_name] = (
+					_resample_linear_array(joint_values, source_times, target_times).tolist()
+					if joint_values.shape[0] > 0
+					else []
+				)
 
-			for field_name, width in (("pos", 3), ("rot", 4), ("lin_vel", 3), ("ang_vel", 3)):
-				values = np.asarray(section.get("link", {}).get(field_name, []), dtype=np.float64)
+			link_group = section.setdefault("link", {})
+			for field_name, field_values in list(link_group.items()):
+				values = np.asarray(field_values, dtype=np.float64)
 				if values.size == 0 or link_count == 0:
-					section["link"][field_name] = []
+					link_group[field_name] = []
 					continue
+				spec = self._resolve_entity_field_spec(
+					field_name,
+					values,
+					length=length,
+					entity_count=link_count,
+					known_specs=self.DEFAULT_LINK_FIELD_SPECS,
+				)
+				if spec is None:
+					raise ValueError(
+						f"Cannot infer shape for {data_name}.link.{field_name} during resample "
+						f"(expected length={length}, links={link_count})"
+					)
+				width, _ = spec
 				values = values.reshape((length, link_count, width))
-				resampled_values = _resample_quaternion_array(values, source_times, target_times) if field_name == "rot" else _resample_linear_array(values, source_times, target_times)
-				section["link"][field_name] = resampled_values.tolist()
+				resampled_values = (
+					_resample_quaternion_array(values, source_times, target_times)
+					if field_name in self._QUATERNION_FIELD_NAMES
+					else _resample_linear_array(values, source_times, target_times)
+				)
+				link_group[field_name] = resampled_values.tolist()
 
-			for field_name, width in (("pos", 3), ("rot", 4), ("gyro", 3), ("acc", 3), ("lin_vel", 3)):
-				values = np.asarray(section.get("imu", {}).get(field_name, []), dtype=np.float64)
+			imu_group = section.setdefault("imu", {})
+			for field_name, field_values in list(imu_group.items()):
+				values = np.asarray(field_values, dtype=np.float64)
 				if values.size == 0 or imu_count == 0:
-					section["imu"][field_name] = []
+					imu_group[field_name] = []
 					continue
+				spec = self._resolve_entity_field_spec(
+					field_name,
+					values,
+					length=length,
+					entity_count=imu_count,
+					known_specs=self.DEFAULT_IMU_FIELD_SPECS,
+				)
+				if spec is None:
+					raise ValueError(
+						f"Cannot infer shape for {data_name}.imu.{field_name} during resample "
+						f"(expected length={length}, imus={imu_count})"
+					)
+				width, _ = spec
 				values = values.reshape((length, imu_count, width))
-				resampled_values = _resample_quaternion_array(values, source_times, target_times) if field_name == "rot" else _resample_linear_array(values, source_times, target_times)
-				section["imu"][field_name] = resampled_values.tolist()
+				resampled_values = (
+					_resample_quaternion_array(values, source_times, target_times)
+					if field_name in self._QUATERNION_FIELD_NAMES
+					else _resample_linear_array(values, source_times, target_times)
+				)
+				imu_group[field_name] = resampled_values.tolist()
 
 			time_values = _normalize_time_array(section.get("time", []), time_name_count=time_name_count)
 			section["time"] = _resample_linear_array(time_values, source_times, target_times).tolist() if time_values.shape[0] > 0 else []
@@ -833,14 +921,14 @@ class OMF:
 
 		joint_group = section.get("joint", {})
 		joint_total_dim = int(sum(joint_dims))
-		for field_name in ("pos", "vel", "acc", "tau", "temp", "voltage", "current"):
-			if not joint_group.get(field_name):
+		for field_name, field_values in joint_group.items():
+			if not field_values:
 				continue
 			field_prefix = f"{data_name}.joint.{field_name}."
 			need_field = include_keys is None or any(key.startswith(field_prefix) for key in include_keys)
 			values = None
 			if include_values and need_field and joint_total_dim > 0:
-				values = _as_float_array(joint_group.get(field_name, []), width=joint_total_dim)
+				values = _as_float_array(field_values, width=joint_total_dim)
 				if values.shape[0] == 0:
 					continue
 			elif include_values and not need_field:
@@ -865,20 +953,24 @@ class OMF:
 				start += joint_dim
 
 		link_group = section.get("link", {})
-		link_specs = {
-			"pos": (3, ("x", "y", "z")),
-			"rot": (4, ("x", "y", "z", "w")),
-			"lin_vel": (3, ("x", "y", "z")),
-			"ang_vel": (3, ("x", "y", "z")),
-		}
-		for field_name, (width, axes) in link_specs.items():
-			if not link_group.get(field_name) or not link_names:
+		for field_name, field_values in link_group.items():
+			if not field_values or not link_names:
 				continue
+			spec = self._resolve_entity_field_spec(
+				field_name,
+				field_values,
+				length=length,
+				entity_count=len(link_names),
+				known_specs=self.DEFAULT_LINK_FIELD_SPECS,
+			)
+			if spec is None:
+				continue
+			width, axes = spec
 			field_prefix = f"{data_name}.link.{field_name}."
 			need_field = include_keys is None or any(key.startswith(field_prefix) for key in include_keys)
 			values = None
 			if include_values and need_field:
-				raw = np.asarray(link_group.get(field_name, []), dtype=np.float64)
+				raw = np.asarray(field_values, dtype=np.float64)
 				if raw.size == 0:
 					continue
 				values = raw.reshape((raw.shape[0], len(link_names), width))
@@ -894,21 +986,24 @@ class OMF:
 					)
 
 		imu_group = section.get("imu", {})
-		imu_specs = {
-			"pos": (3, ("x", "y", "z")),
-			"rot": (4, ("x", "y", "z", "w")),
-			"gyro": (3, ("x", "y", "z")),
-			"acc": (3, ("x", "y", "z")),
-			"lin_vel": (3, ("x", "y", "z")),
-		}
-		for field_name, (width, axes) in imu_specs.items():
-			if not imu_group.get(field_name) or not imu_names:
+		for field_name, field_values in imu_group.items():
+			if not field_values or not imu_names:
 				continue
+			spec = self._resolve_entity_field_spec(
+				field_name,
+				field_values,
+				length=length,
+				entity_count=len(imu_names),
+				known_specs=self.DEFAULT_IMU_FIELD_SPECS,
+			)
+			if spec is None:
+				continue
+			width, axes = spec
 			field_prefix = f"{data_name}.imu.{field_name}."
 			need_field = include_keys is None or any(key.startswith(field_prefix) for key in include_keys)
 			values = None
 			if include_values and need_field:
-				raw = np.asarray(imu_group.get(field_name, []), dtype=np.float64)
+				raw = np.asarray(field_values, dtype=np.float64)
 				if raw.size == 0:
 					continue
 				values = raw.reshape((raw.shape[0], len(imu_names), width))

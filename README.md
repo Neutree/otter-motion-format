@@ -71,6 +71,9 @@ target/model_target/actual: # same as basic.data_names, recommend use target and
         acc: [] # Same format as joint.pos, joint accelerations
         tau: [] # Same format as joint.pos, joint torques
         temp: [] # Same format as joint.pos, joint temperature
+        voltage: []
+        current: []
+        # ... More customized keys
     link:
         pos: []     # shape: (length, len(link_names), 3(xyz)) Position in the world coordinate system
         rot: []     # shape: (length, len(link_names), 4(xyzw)) Rotation in the world coordinate system
